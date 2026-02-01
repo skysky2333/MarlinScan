@@ -43,6 +43,15 @@ Tuning tip:
 - Effective XY speed is approximately `min(SpeedXY, tick_hz * step_mm)`. For example: `40 Hz * 1.0 mm ≈ 40 mm/s`.
 - If it’s choppy with tiny steps, increase **Max step/tick** and/or **Tick (Hz)**, or enable **Motion Boost**.
 
+## Realtime Keyboard (Move tab)
+
+The **Move** tab also has **Realtime Keyboard** controls that stream short relative moves while keys are held:
+
+- Arrow keys = X/Y
+- Shift = Z+ ; Control = Z-
+
+This uses the same idea as Bed Realtime: tune **Tick (Hz)** and **Buffer (ms)** for responsiveness vs smoothness.
+
 ## Benchmarking (optional)
 
 If you want to measure how fast your firmware acknowledges small moves:

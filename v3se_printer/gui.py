@@ -179,6 +179,25 @@ class PrinterGUI(tk.Tk):
         self._rt_queue_time_s = 0.0
         self._rt_last_tick_time: float | None = None
 
+        # Realtime keyboard jog (arrow keys → XY, Shift/Ctrl → Z).
+        self._kb_active = False
+        self._kb_pending_start = False
+        self._kb_pending_acks = 0
+        self._kb_restore_coord_mode: str | None = None
+        self._kb_virtual_x: float | None = None
+        self._kb_virtual_y: float | None = None
+        self._kb_virtual_z: float | None = None
+        self._kb_keys_down: set[str] = set()
+        self._kb_queue_time_s = 0.0
+        self._kb_last_tick_time: float | None = None
+
+        self._kb_tick_hz_var = tk.StringVar(value="100")
+        self._kb_step_xy_mm_var = tk.StringVar(value="4")
+        self._kb_step_z_mm_var = tk.StringVar(value="0.5")
+        self._kb_sync_m400_var = tk.BooleanVar(value=False)
+        self._kb_buffer_ms_var = tk.StringVar(value="30")
+        self._kb_status_var = tk.StringVar(value="Stopped")
+
         self._build_ui()
         self._set_controls_connected(False)
         self.refresh_ports()
@@ -442,6 +461,42 @@ class PrinterGUI(tk.Tk):
 
         ttk.Button(pad, text="Z+", width=6, command=lambda: self.jog_z(+1)).grid(row=0, column=3, padx=(16, 0))
         ttk.Button(pad, text="Z-", width=6, command=lambda: self.jog_z(-1)).grid(row=2, column=3, padx=(16, 0))
+
+        kb = ttk.LabelFrame(parent, text="Realtime Keyboard (experimental)", padding=10)
+        kb.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
+        ttk.Label(
+            kb,
+            text="Controls: Arrow keys = X/Y, Shift = Z+, Control = Z-. Hold keys to move. Combos work (e.g. Up+Right).",
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=6, sticky=tk.W)
+
+        kb_btns = ttk.Frame(kb)
+        kb_btns.grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+        self.kb_start_btn = ttk.Button(kb_btns, text="Start", command=self._kb_start)
+        self.kb_start_btn.grid(row=0, column=0, sticky=tk.W)
+        self.kb_stop_btn = ttk.Button(kb_btns, text="Stop", command=self._kb_stop, state="disabled")
+        self.kb_stop_btn.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
+        ttk.Label(kb, textvariable=self._kb_status_var).grid(row=1, column=1, columnspan=5, sticky=tk.W, padx=(10, 0), pady=(8, 0))
+
+        kb_grid = ttk.Frame(kb)
+        kb_grid.grid(row=2, column=0, columnspan=6, sticky=tk.W, pady=(10, 0))
+        ttk.Label(kb_grid, text="Tick (Hz):").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(kb_grid, textvariable=self._kb_tick_hz_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=(6, 12))
+        ttk.Label(kb_grid, text="Max step XY/tick (mm):").grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(kb_grid, textvariable=self._kb_step_xy_mm_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=(6, 12))
+        ttk.Label(kb_grid, text="Max step Z/tick (mm):").grid(row=0, column=4, sticky=tk.W)
+        ttk.Entry(kb_grid, textvariable=self._kb_step_z_mm_var, width=8).grid(row=0, column=5, sticky=tk.W, padx=(6, 0))
+
+        ttk.Label(kb_grid, text="Buffer (ms):").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Entry(kb_grid, textvariable=self._kb_buffer_ms_var, width=8).grid(
+            row=1, column=1, sticky=tk.W, padx=(6, 12), pady=(6, 0)
+        )
+        ttk.Checkbutton(kb_grid, text="Sync each tick (M400)", variable=self._kb_sync_m400_var).grid(
+            row=1, column=2, columnspan=2, sticky=tk.W, pady=(6, 0)
+        )
+        ttk.Checkbutton(kb_grid, text="Motion Boost (M201/M204/M205 J)", variable=self._rt_boost_motion_var).grid(
+            row=1, column=4, columnspan=2, sticky=tk.W, pady=(6, 0)
+        )
 
         home = ttk.LabelFrame(parent, text="Homing (G28)", padding=10)
         home.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
@@ -887,6 +942,9 @@ class PrinterGUI(tk.Tk):
         if self._ser is None:
             messagebox.showerror("Bed Realtime", "Not connected.")
             return
+        if self._kb_active:
+            messagebox.showerror("Bed Realtime", "Stop Realtime Keyboard first.")
+            return
 
         if bool(self._confirm_motion_var.get()):
             ok = messagebox.askokcancel(
@@ -1123,6 +1181,294 @@ class PrinterGUI(tk.Tk):
 
         self._redraw_rt_bed()
         self.after(interval_ms, self._rt_tick)
+
+    @staticmethod
+    def _clamp_delta(pos: float, delta: float, lo: float, hi: float) -> float:
+        # If we're already outside a bound, prevent moving farther out.
+        if delta > 0:
+            if pos >= hi:
+                return 0.0
+            if (pos + delta) > hi:
+                return hi - pos
+            return delta
+        if delta < 0:
+            if pos <= lo:
+                return 0.0
+            if (pos + delta) < lo:
+                return lo - pos
+            return delta
+        return 0.0
+
+    def _kb_key_of_event(self, event: tk.Event) -> str | None:
+        key = str(getattr(event, "keysym", "") or "")
+        if key in {"Up", "Down", "Left", "Right"}:
+            return key
+        if key in {"Shift_L", "Shift_R"}:
+            return "Shift"
+        if key in {"Control_L", "Control_R"}:
+            return "Control"
+        return None
+
+    def _kb_on_key_press(self, event: tk.Event) -> str | None:
+        if not self._kb_active:
+            return None
+        key = self._kb_key_of_event(event)
+        if key is None:
+            return None
+        self._kb_keys_down.add(key)
+        return "break"
+
+    def _kb_on_key_release(self, event: tk.Event) -> str | None:
+        if not self._kb_active:
+            return None
+        key = self._kb_key_of_event(event)
+        if key is None:
+            return None
+        self._kb_keys_down.discard(key)
+        return "break"
+
+    def _kb_start(self) -> None:
+        if self._ser is None:
+            messagebox.showerror("Realtime Keyboard", "Not connected.")
+            return
+        if self._rt_active:
+            messagebox.showerror("Realtime Keyboard", "Stop Bed Realtime first.")
+            return
+        if self._kb_active:
+            return
+
+        if bool(self._confirm_motion_var.get()):
+            ok = messagebox.askokcancel(
+                "Realtime Keyboard",
+                "This will continuously jog while keys are held.\n\n"
+                "Controls:\n"
+                "  • Arrow keys = X/Y\n"
+                "  • Shift = Z+\n"
+                "  • Control = Z-\n\n"
+                "Make sure the nozzle is at a safe Z height and the bed is clear.\n\nContinue?",
+            )
+            if not ok:
+                return
+
+        self._kb_active = True
+        self._kb_pending_start = True
+        self._kb_pending_acks = 0
+        self._kb_keys_down.clear()
+        self._kb_queue_time_s = 0.0
+        self._kb_last_tick_time = time.monotonic()
+        self._kb_virtual_x = None
+        self._kb_virtual_y = None
+        self._kb_virtual_z = None
+
+        if hasattr(self, "kb_start_btn"):
+            self.kb_start_btn.configure(state="disabled")
+        if hasattr(self, "kb_stop_btn"):
+            self.kb_stop_btn.configure(state="normal")
+
+        # Prefer keeping focus on the main window so arrow keys don't get consumed by Entry widgets.
+        try:
+            self.focus_set()
+        except Exception:
+            pass
+
+        self._kb_restore_coord_mode = self._coord_mode_var.get()
+        self._coord_mode_var.set("relative")
+        self._send("G91", log=False, priority="high", tag="kb_g91", timeout_s=3.0, interactive=False)
+
+        # Ensure we have an up-to-date position snapshot for bounds.
+        self._send("M114", log=False, priority="high", tag="kb_m114_start", timeout_s=3.0, interactive=False)
+        self._kb_status_var.set("Starting (waiting for M114)…")
+
+        # Optional motion boost (shared settings with Bed Realtime).
+        self._rt_apply_motion_boost()
+
+        # Install key listeners.
+        self.bind_all("<KeyPress>", self._kb_on_key_press, add="+")
+        self.bind_all("<KeyRelease>", self._kb_on_key_release, add="+")
+
+        self.after(0, self._kb_tick)
+
+    def _kb_stop(self) -> None:
+        if not self._kb_active and not self._kb_pending_start:
+            return
+        self._kb_active = False
+        self._kb_pending_start = False
+        self._kb_pending_acks = 0
+        self._kb_keys_down.clear()
+        self._kb_queue_time_s = 0.0
+        self._kb_last_tick_time = None
+        self._kb_status_var.set("Stopped")
+
+        try:
+            self.unbind_all("<KeyPress>")
+            self.unbind_all("<KeyRelease>")
+        except Exception:
+            pass
+
+        self._rt_restore_motion_boost()
+
+        restore = self._kb_restore_coord_mode
+        self._kb_restore_coord_mode = None
+        if restore in {"absolute", "relative"}:
+            self._coord_mode_var.set(restore)
+            self.apply_coord_mode()
+
+        if hasattr(self, "kb_start_btn"):
+            self.kb_start_btn.configure(state="normal")
+        if hasattr(self, "kb_stop_btn"):
+            self.kb_stop_btn.configure(state="disabled")
+
+    def _kb_tick(self) -> None:
+        if not self._kb_active:
+            return
+
+        hz = self._rt_float(self._kb_tick_hz_var.get(), default=60.0)
+        hz = max(1.0, min(100.0, hz))
+        interval_ms = int(round(1000.0 / hz))
+        dt = 1.0 / hz
+
+        step_xy_cap = self._rt_float(self._kb_step_xy_mm_var.get(), default=4.0)
+        step_xy_cap = max(0.01, min(50.0, step_xy_cap))
+        step_z_cap = self._rt_float(self._kb_step_z_mm_var.get(), default=0.5)
+        step_z_cap = max(0.001, min(50.0, step_z_cap))
+
+        buffer_ms = self._rt_float(self._kb_buffer_ms_var.get(), default=30.0)
+        buffer_ms = max(0.0, min(500.0, buffer_ms))
+        buffer_s = buffer_ms / 1000.0
+
+        now = time.monotonic()
+        if self._kb_last_tick_time is None:
+            self._kb_last_tick_time = now
+        elapsed = max(0.0, now - self._kb_last_tick_time)
+        self._kb_last_tick_time = now
+        self._kb_queue_time_s = max(0.0, float(self._kb_queue_time_s) - elapsed)
+
+        if self._ser is None or self._worker is None:
+            self._kb_status_var.set("Stopped (disconnected)")
+            self._kb_active = False
+            return
+
+        # Keep focus on the main window so arrow keys are reliably captured.
+        if self._kb_keys_down:
+            try:
+                self.focus_set()
+            except Exception:
+                pass
+
+        # Backpressure: don't queue unbounded commands if the printer stops responding.
+        target_moves = max(1, int(math.ceil(max(buffer_s, dt) * hz)))
+        max_pending = max(6, target_moves + 8)
+        if self._kb_pending_acks > max_pending:
+            self._kb_status_var.set(f"Running (backlog {self._kb_pending_acks}, q≈{self._kb_queue_time_s*1000:.0f}ms)")
+            self.after(interval_ms, self._kb_tick)
+            return
+
+        # Need an initial position to enforce bounds.
+        if self._kb_pending_start or self._kb_virtual_x is None or self._kb_virtual_y is None or self._kb_virtual_z is None:
+            self._kb_status_var.set(f"Starting (waiting for position, q≈{self._kb_queue_time_s*1000:.0f}ms)…")
+            self.after(interval_ms, self._kb_tick)
+            return
+
+        dx_dir = (1 if "Right" in self._kb_keys_down else 0) + (-1 if "Left" in self._kb_keys_down else 0)
+        dy_dir = (1 if "Up" in self._kb_keys_down else 0) + (-1 if "Down" in self._kb_keys_down else 0)
+        dz_dir = (1 if "Shift" in self._kb_keys_down else 0) + (-1 if "Control" in self._kb_keys_down else 0)
+
+        if dx_dir == 0 and dy_dir == 0 and dz_dir == 0:
+            self._kb_status_var.set(f"Running (idle, q≈{self._kb_queue_time_s*1000:.0f}ms)")
+            self.after(interval_ms, self._kb_tick)
+            return
+
+        sync_each_tick = bool(self._kb_sync_m400_var.get())
+        desired_queue_s = max(buffer_s, dt)
+        if sync_each_tick:
+            desired_queue_s = dt
+
+        x_min, x_max, y_min, y_max, z_min, z_max = self._bed_bounds()
+
+        v_xy = max(1e-6, float(self._speed_xy_var.get()))
+        v_z = max(1e-6, float(self._speed_z_var.get()))
+
+        segments_sent = 0
+        last_speed = 0.0
+
+        while self._kb_queue_time_s + 1e-9 < desired_queue_s:
+            vx = float(self._kb_virtual_x)
+            vy = float(self._kb_virtual_y)
+            vz = float(self._kb_virtual_z)
+
+            dx = 0.0
+            dy = 0.0
+            if dx_dir != 0 or dy_dir != 0:
+                norm = math.hypot(dx_dir, dy_dir)
+                if norm > 1e-9:
+                    dx = (dx_dir / norm) * v_xy * dt
+                    dy = (dy_dir / norm) * v_xy * dt
+                    xy_len = math.hypot(dx, dy)
+                    if xy_len > step_xy_cap:
+                        s = step_xy_cap / max(1e-9, xy_len)
+                        dx *= s
+                        dy *= s
+
+            dz = 0.0
+            if dz_dir != 0:
+                dz = float(dz_dir) * v_z * dt
+                if abs(dz) > step_z_cap:
+                    dz = math.copysign(step_z_cap, dz)
+
+            dx = self._clamp_delta(vx, dx, x_min, x_max)
+            dy = self._clamp_delta(vy, dy, y_min, y_max)
+            dz = self._clamp_delta(vz, dz, z_min, z_max)
+
+            if abs(dx) <= 1e-9 and abs(dy) <= 1e-9 and abs(dz) <= 1e-9:
+                break
+
+            parts: list[str] = []
+            if abs(dx) > 1e-9:
+                parts.append(f"X{dx:g}")
+            if abs(dy) > 1e-9:
+                parts.append(f"Y{dy:g}")
+            if abs(dz) > 1e-9:
+                parts.append(f"Z{dz:g}")
+            if not parts:
+                break
+
+            actual_len = math.sqrt((dx * dx) + (dy * dy) + (dz * dz))
+            speed = max(1e-6, min(actual_len / dt, 500.0))
+            feed = max(1, self._mm_s_to_mm_min(speed))
+
+            sent = self._send(
+                f"G0 {' '.join(parts)} F{feed}",
+                log=False,
+                priority="high",
+                tag="kb_move",
+                timeout_s=10.0,
+                interactive=False,
+            )
+            if not sent:
+                break
+
+            self._kb_pending_acks += 1
+            self._kb_virtual_x = vx + dx
+            self._kb_virtual_y = vy + dy
+            self._kb_virtual_z = vz + dz
+            self._kb_queue_time_s += dt
+            last_speed = speed
+            segments_sent += 1
+
+            if sync_each_tick:
+                if self._send("M400", log=False, priority="high", tag="kb_m400", timeout_s=300.0, interactive=False):
+                    self._kb_pending_acks += 1
+                break
+
+            if segments_sent >= 20:
+                break
+
+        if segments_sent > 0:
+            self._kb_status_var.set(f"Running (v≈{last_speed:.0f} mm/s, q≈{self._kb_queue_time_s*1000:.0f}ms)")
+        else:
+            self._kb_status_var.set(f"Running (q≈{self._kb_queue_time_s*1000:.0f}ms)")
+
+        self.after(interval_ms, self._kb_tick)
 
     def _bed_bounds(self) -> tuple[float, float, float, float, float, float]:
         # Treat the UI bed/work area as 0..Xmax and 0..Ymax.
@@ -1494,7 +1840,7 @@ class PrinterGUI(tk.Tk):
                 # This keeps homing/setup actions snappy and avoids interleaving.
                 self.after(int(interval_s * 1000), self._poll_tick)
                 return
-            if self._rt_active:
+            if self._rt_active or self._kb_active:
                 # Avoid injecting M105/M114 while realtime motion streaming is active.
                 self.after(int(interval_s * 1000), self._poll_tick)
                 return
@@ -1568,6 +1914,8 @@ class PrinterGUI(tk.Tk):
 
         if job.tag in {"rt_move", "rt_m400"} and self._rt_pending_acks > 0:
             self._rt_pending_acks -= 1
+        if job.tag in {"kb_move", "kb_m400"} and self._kb_pending_acks > 0:
+            self._kb_pending_acks -= 1
         if job.tag == "rt_m114_start":
             if not ok:
                 self._rt_pending_start = False
@@ -1589,6 +1937,31 @@ class PrinterGUI(tk.Tk):
                     self._rt_pending_start = False
                     self._rt_status_var.set("Running")
                     self._redraw_rt_bed()
+                    break
+        if job.tag == "kb_m114_start":
+            if not ok:
+                self._kb_pending_start = False
+                self._kb_active = False
+                self._kb_status_var.set("Stopped (M114 failed)")
+                if hasattr(self, "kb_start_btn"):
+                    self.kb_start_btn.configure(state="normal")
+                if hasattr(self, "kb_stop_btn"):
+                    self.kb_stop_btn.configure(state="disabled")
+            elif self._kb_active and self._kb_pending_start:
+                for line in lines:
+                    if line.lstrip().lower().startswith("count"):
+                        continue
+                    pos = parse_m114(line)
+                    if pos is None:
+                        continue
+                    x, y, z, _e = pos
+                    if x is None or y is None or z is None:
+                        continue
+                    self._kb_virtual_x = float(x)
+                    self._kb_virtual_y = float(y)
+                    self._kb_virtual_z = float(z)
+                    self._kb_pending_start = False
+                    self._kb_status_var.set("Running")
                     break
 
         if job.tag == "poll_m105":
@@ -2503,6 +2876,25 @@ class PrinterGUI(tk.Tk):
             return
 
         # Stop realtime streaming first (avoid scheduling more commands while closing the port).
+        self._kb_active = False
+        self._kb_pending_start = False
+        self._kb_pending_acks = 0
+        self._kb_keys_down.clear()
+        self._kb_status_var.set("Stopped (disconnected)")
+        self._kb_restore_coord_mode = None
+        self._kb_virtual_x = None
+        self._kb_virtual_y = None
+        self._kb_virtual_z = None
+        try:
+            self.unbind_all("<KeyPress>")
+            self.unbind_all("<KeyRelease>")
+        except Exception:
+            pass
+        if hasattr(self, "kb_start_btn"):
+            self.kb_start_btn.configure(state="normal")
+        if hasattr(self, "kb_stop_btn"):
+            self.kb_stop_btn.configure(state="disabled")
+
         self._rt_active = False
         self._rt_pending_start = False
         self._rt_pending_acks = 0
