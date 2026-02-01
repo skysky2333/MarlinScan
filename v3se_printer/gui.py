@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import queue
 import threading
 import time
@@ -146,6 +147,26 @@ class PrinterGUI(tk.Tk):
         self._current_y: float | None = None
         self._current_z: float | None = None
 
+        # Realtime bed tracking (mouse → incremental jog streaming).
+        self._rt_active = False
+        self._rt_mouse_down = False
+        self._rt_mouse_inside = False
+        self._rt_virtual_x: float | None = None
+        self._rt_virtual_y: float | None = None
+        self._rt_pending_start = False
+        self._rt_pending_acks = 0
+        self._rt_restore_coord_mode: str | None = None
+
+        self._rt_hold_mouse_var = tk.BooleanVar(value=True)
+        self._rt_tick_hz_var = tk.StringVar(value="40")
+        self._rt_step_mm_var = tk.StringVar(value="1.0")
+        self._rt_deadband_mm_var = tk.StringVar(value="0.2")
+        self._rt_sync_m400_var = tk.BooleanVar(value=False)
+
+        self._rt_target_x_var = tk.DoubleVar(value=0.0)
+        self._rt_target_y_var = tk.DoubleVar(value=0.0)
+        self._rt_status_var = tk.StringVar(value="Stopped")
+
         self._build_ui()
         self._set_controls_connected(False)
         self.refresh_ports()
@@ -243,6 +264,7 @@ class PrinterGUI(tk.Tk):
         quick_tab = ttk.Frame(self.notebook, padding=10)
         move_tab = ttk.Frame(self.notebook, padding=10)
         bed_tab = ttk.Frame(self.notebook, padding=10)
+        bed_realtime_tab = ttk.Frame(self.notebook, padding=10)
         temps_tab = ttk.Frame(self.notebook, padding=10)
         tuning_tab = ttk.Frame(self.notebook, padding=10)
         maint_tab = ttk.Frame(self.notebook, padding=10)
@@ -250,6 +272,7 @@ class PrinterGUI(tk.Tk):
         self.notebook.add(quick_tab, text="Quick")
         self.notebook.add(move_tab, text="Move")
         self.notebook.add(bed_tab, text="Bed")
+        self.notebook.add(bed_realtime_tab, text="Bed Realtime")
         self.notebook.add(temps_tab, text="Temps/Fan")
         self.notebook.add(tuning_tab, text="Tuning")
         self.notebook.add(maint_tab, text="Level/EEPROM")
@@ -257,6 +280,7 @@ class PrinterGUI(tk.Tk):
         self._build_quick_tab(quick_tab)
         self._build_move_tab(move_tab)
         self._build_bed_tab(bed_tab)
+        self._build_bed_realtime_tab(bed_realtime_tab)
         self._build_temps_tab(temps_tab)
         self._build_tuning_tab(tuning_tab)
         self._build_maint_tab(maint_tab)
@@ -535,6 +559,380 @@ class PrinterGUI(tk.Tk):
         self._update_speed_labels()
         self._sync_z_slider_from_target()
         self._redraw_bed()
+
+    def _build_bed_realtime_tab(self, parent: ttk.Frame) -> None:
+        intro = ttk.LabelFrame(parent, text="Mouse → Realtime XY Jog", padding=10)
+        intro.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(
+            intro,
+            text=(
+                "Streams tiny XY moves to follow your mouse. This is best-effort (Marlin queues moves).\n"
+                "Tip: start with 40 Hz, 1.0 mm step, and Speed XY ≈ 40 mm/s."
+            ),
+            justify=tk.LEFT,
+        ).pack(side=tk.TOP, anchor=tk.W)
+
+        body = ttk.Frame(parent)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        left = ttk.Frame(body)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right = ttk.LabelFrame(body, text="Controls", padding=10)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+
+        self.rt_canvas = tk.Canvas(left, width=360, height=360, background="white", highlightthickness=1)
+        self.rt_canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.rt_canvas.bind("<Configure>", lambda _e: self._redraw_rt_bed())
+        self.rt_canvas.bind("<Motion>", self._on_rt_motion)
+        self.rt_canvas.bind("<Leave>", self._on_rt_leave)
+        self.rt_canvas.bind("<ButtonPress-1>", self._on_rt_press)
+        self.rt_canvas.bind("<ButtonRelease-1>", self._on_rt_release)
+
+        btns = ttk.Frame(right)
+        btns.pack(side=tk.TOP, fill=tk.X)
+        self.rt_start_btn = ttk.Button(btns, text="Start", command=self._rt_start)
+        self.rt_start_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.rt_stop_btn = ttk.Button(btns, text="Stop", command=self._rt_stop, state="disabled")
+        self.rt_stop_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        ttk.Label(right, textvariable=self._rt_status_var).pack(side=tk.TOP, anchor=tk.W, pady=(10, 0))
+
+        ttk.Checkbutton(right, text="Hold left mouse to move", variable=self._rt_hold_mouse_var).pack(
+            side=tk.TOP, anchor=tk.W, pady=(10, 0)
+        )
+        ttk.Checkbutton(right, text="Sync each tick (M400)", variable=self._rt_sync_m400_var).pack(
+            side=tk.TOP, anchor=tk.W, pady=(6, 0)
+        )
+
+        grid = ttk.Frame(right)
+        grid.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
+        ttk.Label(grid, text="Tick (Hz):").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(grid, textvariable=self._rt_tick_hz_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=(6, 0))
+        ttk.Label(grid, text="Max step (mm):").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Entry(grid, textvariable=self._rt_step_mm_var, width=8).grid(
+            row=1, column=1, sticky=tk.W, padx=(6, 0), pady=(6, 0)
+        )
+        ttk.Label(grid, text="Deadband (mm):").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Entry(grid, textvariable=self._rt_deadband_mm_var, width=8).grid(
+            row=2, column=1, sticky=tk.W, padx=(6, 0), pady=(6, 0)
+        )
+        grid.grid_columnconfigure(1, weight=1)
+
+        ttk.Button(right, text="Target = Current", command=self._rt_target_from_current).pack(
+            side=tk.TOP, fill=tk.X, pady=(10, 0)
+        )
+
+        self._redraw_rt_bed()
+
+    def _rt_target_from_current(self) -> None:
+        if self._current_x is None or self._current_y is None:
+            return
+        self._rt_target_x_var.set(float(self._current_x))
+        self._rt_target_y_var.set(float(self._current_y))
+        if self._rt_virtual_x is None or self._rt_virtual_y is None:
+            self._rt_virtual_x = float(self._current_x)
+            self._rt_virtual_y = float(self._current_y)
+        self._redraw_rt_bed()
+
+    def _rt_canvas_square(self) -> tuple[float, float, float, int, int]:
+        if not hasattr(self, "rt_canvas"):
+            return (0.0, 0.0, 1.0, 1, 1)
+        w = max(1, int(self.rt_canvas.winfo_width()))
+        h = max(1, int(self.rt_canvas.winfo_height()))
+        size = float(min(w, h))
+        ox = (w - size) / 2.0
+        oy = (h - size) / 2.0
+        return (ox, oy, size, w, h)
+
+    def _rt_canvas_to_bed(self, px: float, py: float) -> tuple[float, float]:
+        if not hasattr(self, "rt_canvas"):
+            return (0.0, 0.0)
+        ox, oy, size, _w, _h = self._rt_canvas_square()
+        x_min, x_max, y_min, y_max, _z_min, _z_max = self._bed_bounds()
+        px = self._clamp(px, ox, ox + size)
+        py = self._clamp(py, oy, oy + size)
+        x_n = (px - ox) / size
+        y_n = 1.0 - ((py - oy) / size)
+        x = x_min + x_n * (x_max - x_min)
+        y = y_min + y_n * (y_max - y_min)
+        return (x, y)
+
+    def _rt_bed_to_canvas(self, x: float, y: float) -> tuple[float, float]:
+        if not hasattr(self, "rt_canvas"):
+            return (0.0, 0.0)
+        ox, oy, size, _w, _h = self._rt_canvas_square()
+        x_min, x_max, y_min, y_max, _z_min, _z_max = self._bed_bounds()
+        x_n = (x - x_min) / (x_max - x_min)
+        y_n = (y - y_min) / (y_max - y_min)
+        px = ox + (x_n * size)
+        py = oy + ((1.0 - y_n) * size)
+        return (px, py)
+
+    def _redraw_rt_bed(self) -> None:
+        if not hasattr(self, "rt_canvas"):
+            return
+        x_min, x_max, y_min, y_max, _z_min, _z_max = self._bed_bounds()
+
+        c = self.rt_canvas
+        c.delete("all")
+        ox, oy, size, _w, _h = self._rt_canvas_square()
+
+        # Border (square inside the canvas to keep aspect ratio)
+        c.create_rectangle(ox + 2, oy + 2, ox + size - 2, oy + size - 2, outline="#222", width=2)
+
+        # Grid every 20mm (approx).
+        step = 20.0
+        x = x_min
+        while x <= x_max + 1e-6:
+            px, _ = self._rt_bed_to_canvas(x, y_min)
+            c.create_line(px, oy, px, oy + size, fill="#eee")
+            x += step
+        y = y_min
+        while y <= y_max + 1e-6:
+            _, py = self._rt_bed_to_canvas(x_min, y)
+            c.create_line(ox, py, ox + size, py, fill="#eee")
+            y += step
+
+        # Target marker (mouse)
+        tx = self._clamp(float(self._rt_target_x_var.get()), x_min, x_max)
+        ty = self._clamp(float(self._rt_target_y_var.get()), y_min, y_max)
+        self._rt_target_x_var.set(tx)
+        self._rt_target_y_var.set(ty)
+        tpx, tpy = self._rt_bed_to_canvas(tx, ty)
+        c.create_line(tpx - 8, tpy, tpx + 8, tpy, fill="#d11", width=2)
+        c.create_line(tpx, tpy - 8, tpx, tpy + 8, fill="#d11", width=2)
+
+        # Current position marker (from M114)
+        if self._current_x is not None and self._current_y is not None:
+            cx = self._clamp(float(self._current_x), x_min, x_max)
+            cy = self._clamp(float(self._current_y), y_min, y_max)
+            cpx, cpy = self._rt_bed_to_canvas(cx, cy)
+            r = 5
+            c.create_oval(cpx - r, cpy - r, cpx + r, cpy + r, fill="#1a5", outline="#0b3")
+
+        # Virtual position marker (what we've commanded so far)
+        if self._rt_virtual_x is not None and self._rt_virtual_y is not None:
+            vx = self._clamp(float(self._rt_virtual_x), x_min, x_max)
+            vy = self._clamp(float(self._rt_virtual_y), y_min, y_max)
+            vpx, vpy = self._rt_bed_to_canvas(vx, vy)
+            r = 4
+            c.create_oval(vpx - r, vpy - r, vpx + r, vpy + r, fill="#19f", outline="#06c")
+
+        # Legend
+        legend = "green=current, red=mouse target, blue=commanded"
+        if self._rt_active:
+            if bool(self._rt_hold_mouse_var.get()):
+                legend += " (hold LMB)"
+            legend += " [RUNNING]"
+        c.create_text(ox + 8, oy + size - 10, anchor=tk.W, text=legend, fill="#555")
+
+    def _on_rt_motion(self, event: tk.Event) -> None:
+        x, y = self._rt_canvas_to_bed(float(event.x), float(event.y))
+        x_min, x_max, y_min, y_max, _z_min, _z_max = self._bed_bounds()
+        x = self._clamp(x, x_min, x_max)
+        y = self._clamp(y, y_min, y_max)
+        self._rt_target_x_var.set(x)
+        self._rt_target_y_var.set(y)
+        self._rt_mouse_inside = True
+        self._redraw_rt_bed()
+
+    def _on_rt_leave(self, _event: tk.Event) -> None:
+        self._rt_mouse_inside = False
+        self._rt_mouse_down = False
+        self._redraw_rt_bed()
+
+    def _on_rt_press(self, event: tk.Event) -> None:
+        self._rt_mouse_down = True
+        self._on_rt_motion(event)
+
+    def _on_rt_release(self, _event: tk.Event) -> None:
+        self._rt_mouse_down = False
+        self._redraw_rt_bed()
+
+    @staticmethod
+    def _rt_float(text: str, *, default: float) -> float:
+        try:
+            return float(str(text).strip())
+        except Exception:
+            return float(default)
+
+    def _rt_start(self) -> None:
+        if self._ser is None:
+            messagebox.showerror("Bed Realtime", "Not connected.")
+            return
+
+        if bool(self._confirm_motion_var.get()):
+            ok = messagebox.askokcancel(
+                "Bed Realtime",
+                "This will stream many tiny XY moves based on your mouse.\n\n"
+                "Make sure:\n"
+                "  • The nozzle is at a safe Z height\n"
+                "  • The bed is clear\n"
+                "  • You can hit EMERGENCY STOP if needed\n\n"
+                "Continue?",
+            )
+            if not ok:
+                return
+
+        if self._rt_active:
+            return
+
+        self._rt_active = True
+        if hasattr(self, "rt_start_btn"):
+            self.rt_start_btn.configure(state="disabled")
+        if hasattr(self, "rt_stop_btn"):
+            self.rt_stop_btn.configure(state="normal")
+        self._rt_mouse_down = False
+        self._rt_mouse_inside = False
+        self._rt_pending_acks = 0
+        self._rt_pending_start = False
+
+        self._rt_restore_coord_mode = self._coord_mode_var.get()
+        self._coord_mode_var.set("relative")
+        self._send("G91", log=False, priority="high", tag="rt_g91", timeout_s=3.0, interactive=False)
+
+        if self._current_x is None or self._current_y is None:
+            self._rt_virtual_x = None
+            self._rt_virtual_y = None
+            self._rt_pending_start = True
+            self._send("M114", log=False, priority="high", tag="rt_m114_start", timeout_s=3.0, interactive=False)
+            self._rt_status_var.set("Starting (waiting for M114)…")
+        else:
+            self._rt_virtual_x = float(self._current_x)
+            self._rt_virtual_y = float(self._current_y)
+            self._rt_target_from_current()
+            self._rt_status_var.set("Running")
+
+        self.after(0, self._rt_tick)
+        self._redraw_rt_bed()
+
+    def _rt_stop(self) -> None:
+        if not self._rt_active and not self._rt_pending_start:
+            return
+        self._rt_active = False
+        if hasattr(self, "rt_start_btn"):
+            self.rt_start_btn.configure(state="normal")
+        if hasattr(self, "rt_stop_btn"):
+            self.rt_stop_btn.configure(state="disabled")
+        self._rt_pending_start = False
+        self._rt_mouse_down = False
+        self._rt_mouse_inside = False
+        self._rt_pending_acks = 0
+        self._rt_status_var.set("Stopped")
+
+        restore = self._rt_restore_coord_mode
+        self._rt_restore_coord_mode = None
+        if restore in {"absolute", "relative"}:
+            self._coord_mode_var.set(restore)
+            self.apply_coord_mode()
+
+        self._redraw_rt_bed()
+
+    def _rt_tick(self) -> None:
+        if not self._rt_active:
+            return
+
+        hz = self._rt_float(self._rt_tick_hz_var.get(), default=40.0)
+        hz = max(1.0, min(100.0, hz))
+        interval_ms = int(round(1000.0 / hz))
+
+        step_mm = self._rt_float(self._rt_step_mm_var.get(), default=1.0)
+        step_mm = max(0.01, min(20.0, step_mm))
+
+        deadband = self._rt_float(self._rt_deadband_mm_var.get(), default=0.2)
+        deadband = max(0.0, min(10.0, deadband))
+
+        # If we just started and didn't have a position yet, latch virtual position once M114 arrives.
+        if (self._rt_virtual_x is None or self._rt_virtual_y is None) and self._current_x is not None and self._current_y is not None:
+            self._rt_virtual_x = float(self._current_x)
+            self._rt_virtual_y = float(self._current_y)
+            self._rt_target_from_current()
+            self._rt_pending_start = False
+            self._rt_status_var.set("Running")
+
+        should_move = True
+        if bool(self._rt_hold_mouse_var.get()) and (not self._rt_mouse_down):
+            should_move = False
+        if not self._rt_mouse_inside:
+            should_move = False
+
+        if self._ser is None or self._worker is None:
+            self._rt_status_var.set("Stopped (disconnected)")
+            self._rt_active = False
+            return
+
+        # Avoid piling up commands if the printer stops responding.
+        if self._rt_pending_acks > 4:
+            self._rt_status_var.set(f"Running (backlog {self._rt_pending_acks})")
+            self.after(interval_ms, self._rt_tick)
+            return
+
+        if (
+            (not should_move)
+            or self._rt_virtual_x is None
+            or self._rt_virtual_y is None
+        ):
+            if self._rt_virtual_x is None or self._rt_virtual_y is None:
+                self._rt_status_var.set("Running (waiting for position)…")
+            else:
+                self._rt_status_var.set("Running (idle)")
+            self.after(interval_ms, self._rt_tick)
+            return
+
+        x_min, x_max, y_min, y_max, _z_min, _z_max = self._bed_bounds()
+        vx = self._clamp(float(self._rt_virtual_x), x_min, x_max)
+        vy = self._clamp(float(self._rt_virtual_y), y_min, y_max)
+        self._rt_virtual_x, self._rt_virtual_y = vx, vy
+
+        tx = self._clamp(float(self._rt_target_x_var.get()), x_min, x_max)
+        ty = self._clamp(float(self._rt_target_y_var.get()), y_min, y_max)
+        self._rt_target_x_var.set(tx)
+        self._rt_target_y_var.set(ty)
+
+        dx = tx - vx
+        dy = ty - vy
+        dist = math.hypot(dx, dy)
+        if dist <= deadband:
+            self._rt_status_var.set("Running (on target)")
+            self.after(interval_ms, self._rt_tick)
+            return
+
+        if dist > step_mm:
+            scale = step_mm / dist
+            dx *= scale
+            dy *= scale
+
+        nx = self._clamp(vx + dx, x_min, x_max)
+        ny = self._clamp(vy + dy, y_min, y_max)
+        dx = nx - vx
+        dy = ny - vy
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            self._rt_status_var.set("Running (clamped)")
+            self.after(interval_ms, self._rt_tick)
+            return
+
+        speed = float(self._speed_xy_var.get())
+        feed = self._mm_s_to_mm_min(speed)
+        sent = self._send(
+            f"G0 X{dx:g} Y{dy:g} F{feed}",
+            log=False,
+            priority="high",
+            tag="rt_move",
+            timeout_s=10.0,
+            interactive=False,
+        )
+        if sent:
+            self._rt_pending_acks += 1
+            if bool(self._rt_sync_m400_var.get()):
+                if self._send("M400", log=False, priority="high", tag="rt_m400", timeout_s=300.0, interactive=False):
+                    self._rt_pending_acks += 1
+            self._rt_virtual_x, self._rt_virtual_y = nx, ny
+            self._rt_status_var.set("Running (moving)")
+        else:
+            self._rt_status_var.set("Running (send failed)")
+
+        self._redraw_rt_bed()
+        self.after(interval_ms, self._rt_tick)
 
     def _bed_bounds(self) -> tuple[float, float, float, float, float, float]:
         x_min = float(self._bed_x_min_var.get())
@@ -953,6 +1351,7 @@ class PrinterGUI(tk.Tk):
                 self._pos_var.set(f"X:{x:.2f}  Y:{y:.2f}  Z:{z:.2f}  E:{e_text}")
                 self._update_bed_status()
                 self._redraw_bed()
+                self._redraw_rt_bed()
 
     def _handle_job_done(
         self,
@@ -966,6 +1365,13 @@ class PrinterGUI(tk.Tk):
             # Ensure firmware is extracted even if line events are missed.
             for line in lines:
                 self._handle_incoming_line(line)
+
+        if job.tag in {"rt_move", "rt_m400"} and self._rt_pending_acks > 0:
+            self._rt_pending_acks -= 1
+        if job.tag == "rt_m114_start" and (not ok):
+            self._rt_pending_start = False
+            self._rt_active = False
+            self._rt_status_var.set("Stopped (M114 failed)")
 
         if job.tag == "poll_m105":
             self._poll_pending_m105 = False
@@ -1002,6 +1408,7 @@ class PrinterGUI(tk.Tk):
                     self._pos_var.set(f"X:{x:.2f}  Y:{y:.2f}  Z:{z:.2f}  E:{e_text}")
                     self._update_bed_status()
                     self._redraw_bed()
+                    self._redraw_rt_bed()
                     break
 
         if job.tag.startswith("startup_home:"):
@@ -1865,6 +2272,18 @@ class PrinterGUI(tk.Tk):
         if self._ser is None:
             return
 
+        # Stop realtime streaming first (avoid scheduling more commands while closing the port).
+        self._rt_active = False
+        self._rt_pending_start = False
+        self._rt_pending_acks = 0
+        self._rt_mouse_down = False
+        self._rt_mouse_inside = False
+        self._rt_status_var.set("Stopped (disconnected)")
+        if hasattr(self, "rt_start_btn"):
+            self.rt_start_btn.configure(state="normal")
+        if hasattr(self, "rt_stop_btn"):
+            self.rt_stop_btn.configure(state="disabled")
+
         self._append_log("[disconnect] Closing serial port")
         if self._worker is not None:
             self._worker.clear_queues()
@@ -1904,6 +2323,7 @@ class PrinterGUI(tk.Tk):
         if hasattr(self, "_bed_status_var"):
             self._update_bed_status()
         self._redraw_bed()
+        self._redraw_rt_bed()
 
     def _drain_events(self) -> None:
         if self._worker is not None:
