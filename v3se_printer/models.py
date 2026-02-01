@@ -25,4 +25,5 @@ class GCodeJob:
 class PrinterConfig:
     max_feedrate_mm_s: dict[str, float] = field(default_factory=dict)  # from M203, mm/s
     accel_print_mm_s2: float | None = None  # from M204 P, mm/s^2
-
+    max_accel_mm_s2: dict[str, float] = field(default_factory=dict)  # from M201, mm/s^2
+    junction_deviation: float | None = None  # from M205 J

@@ -70,9 +70,11 @@ def parse_m114(line: str) -> tuple[float | None, float | None, float | None, flo
     return (find("X"), find("Y"), find("Z"), find("E"))
 
 
-def parse_m503(lines: list[str]) -> tuple[dict[str, float], float | None]:
+def parse_m503(lines: list[str]) -> tuple[dict[str, float], float | None, dict[str, float], float | None]:
     max_feed: dict[str, float] = {}
     accel_p: float | None = None
+    max_accel: dict[str, float] = {}
+    junction_dev: float | None = None
 
     for line in lines:
         if "M203" in line:
@@ -86,4 +88,15 @@ def parse_m503(lines: list[str]) -> tuple[dict[str, float], float | None]:
             if m:
                 accel_p = float(m.group(1))
 
-    return max_feed, accel_p
+        if "M201" in line:
+            for axis in ("X", "Y", "Z", "E"):
+                m = re.search(rf"\b{axis}([-+]?\d*\.?\d+)", line)
+                if m:
+                    max_accel[axis] = float(m.group(1))
+
+        if ("M205" in line) and (junction_dev is None):
+            m = re.search(r"\bJ([-+]?\d*\.?\d+)", line)
+            if m:
+                junction_dev = float(m.group(1))
+
+    return max_feed, accel_p, max_accel, junction_dev

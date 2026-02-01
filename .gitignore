@@ -1,3 +1,4 @@
 /.venv
 /__pycache__
+tools/__pycache__
 /v3se_printer/__pycache__

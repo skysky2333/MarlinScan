@@ -158,14 +158,26 @@ class PrinterGUI(tk.Tk):
         self._rt_restore_coord_mode: str | None = None
 
         self._rt_hold_mouse_var = tk.BooleanVar(value=True)
-        self._rt_tick_hz_var = tk.StringVar(value="40")
-        self._rt_step_mm_var = tk.StringVar(value="1.0")
+        self._rt_tick_hz_var = tk.StringVar(value="100")
+        self._rt_step_mm_var = tk.StringVar(value="4")
         self._rt_deadband_mm_var = tk.StringVar(value="0.2")
         self._rt_sync_m400_var = tk.BooleanVar(value=False)
+        self._rt_buffer_ms_var = tk.StringVar(value="30")
+        self._rt_home_xy_var = tk.BooleanVar(value=False)
+        self._rt_boost_motion_var = tk.BooleanVar(value=True)
+        self._rt_boost_m201_xy_var = tk.StringVar(value="3000")
+        self._rt_boost_m204_var = tk.StringVar(value="3000")
+        self._rt_boost_junction_var = tk.StringVar(value="0.20")
+        self._rt_boost_applied = False
+        self._rt_boost_saved_m201_xy: tuple[float | None, float | None] | None = None
+        self._rt_boost_saved_m204: float | None = None
+        self._rt_boost_saved_junction: float | None = None
 
         self._rt_target_x_var = tk.DoubleVar(value=0.0)
         self._rt_target_y_var = tk.DoubleVar(value=0.0)
         self._rt_status_var = tk.StringVar(value="Stopped")
+        self._rt_queue_time_s = 0.0
+        self._rt_last_tick_time: float | None = None
 
         self._build_ui()
         self._set_controls_connected(False)
@@ -497,12 +509,16 @@ class PrinterGUI(tk.Tk):
         settings.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Label(settings, text="X min:").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(settings, textvariable=self._bed_x_min_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=(6, 12))
+        ttk.Entry(settings, textvariable=self._bed_x_min_var, width=8, state="readonly").grid(
+            row=0, column=1, sticky=tk.W, padx=(6, 12)
+        )
         ttk.Label(settings, text="X max:").grid(row=0, column=2, sticky=tk.W)
         ttk.Entry(settings, textvariable=self._bed_x_max_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=(6, 12))
 
         ttk.Label(settings, text="Y min:").grid(row=0, column=4, sticky=tk.W)
-        ttk.Entry(settings, textvariable=self._bed_y_min_var, width=8).grid(row=0, column=5, sticky=tk.W, padx=(6, 12))
+        ttk.Entry(settings, textvariable=self._bed_y_min_var, width=8, state="readonly").grid(
+            row=0, column=5, sticky=tk.W, padx=(6, 12)
+        )
         ttk.Label(settings, text="Y max:").grid(row=0, column=6, sticky=tk.W)
         ttk.Entry(settings, textvariable=self._bed_y_max_var, width=8).grid(row=0, column=7, sticky=tk.W, padx=(6, 0))
 
@@ -567,7 +583,7 @@ class PrinterGUI(tk.Tk):
             intro,
             text=(
                 "Streams tiny XY moves to follow your mouse. This is best-effort (Marlin queues moves).\n"
-                "Tip: start with 40 Hz, 1.0 mm step, and Speed XY ≈ 40 mm/s."
+                "Tip: effective speed is min(Speed XY, step × Hz). Try 40 Hz, 1.0 mm step, Speed XY 100–250."
             ),
             justify=tk.LEFT,
         ).pack(side=tk.TOP, anchor=tk.W)
@@ -600,6 +616,9 @@ class PrinterGUI(tk.Tk):
         ttk.Checkbutton(right, text="Hold left mouse to move", variable=self._rt_hold_mouse_var).pack(
             side=tk.TOP, anchor=tk.W, pady=(10, 0)
         )
+        ttk.Checkbutton(right, text="Home X/Y on Start (G28 X Y)", variable=self._rt_home_xy_var).pack(
+            side=tk.TOP, anchor=tk.W, pady=(6, 0)
+        )
         ttk.Checkbutton(right, text="Sync each tick (M400)", variable=self._rt_sync_m400_var).pack(
             side=tk.TOP, anchor=tk.W, pady=(6, 0)
         )
@@ -608,7 +627,7 @@ class PrinterGUI(tk.Tk):
         grid.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
         ttk.Label(grid, text="Tick (Hz):").grid(row=0, column=0, sticky=tk.W)
         ttk.Entry(grid, textvariable=self._rt_tick_hz_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=(6, 0))
-        ttk.Label(grid, text="Max step (mm):").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Label(grid, text="Max step/tick (mm):").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
         ttk.Entry(grid, textvariable=self._rt_step_mm_var, width=8).grid(
             row=1, column=1, sticky=tk.W, padx=(6, 0), pady=(6, 0)
         )
@@ -616,7 +635,32 @@ class PrinterGUI(tk.Tk):
         ttk.Entry(grid, textvariable=self._rt_deadband_mm_var, width=8).grid(
             row=2, column=1, sticky=tk.W, padx=(6, 0), pady=(6, 0)
         )
+        ttk.Label(grid, text="Buffer (ms):").grid(row=3, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Entry(grid, textvariable=self._rt_buffer_ms_var, width=8).grid(
+            row=3, column=1, sticky=tk.W, padx=(6, 0), pady=(6, 0)
+        )
         grid.grid_columnconfigure(1, weight=1)
+
+        boost = ttk.LabelFrame(right, text="Motion Boost (optional)", padding=10)
+        boost.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
+        ttk.Checkbutton(boost, text="Apply M201/M204/M205 while running", variable=self._rt_boost_motion_var).pack(
+            side=tk.TOP, anchor=tk.W
+        )
+        boost_grid = ttk.Frame(boost)
+        boost_grid.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+        ttk.Label(boost_grid, text="M201 XY (mm/s^2):").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(boost_grid, textvariable=self._rt_boost_m201_xy_var, width=8).grid(
+            row=0, column=1, sticky=tk.W, padx=(6, 0)
+        )
+        ttk.Label(boost_grid, text="M204 (mm/s^2):").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Entry(boost_grid, textvariable=self._rt_boost_m204_var, width=8).grid(
+            row=1, column=1, sticky=tk.W, padx=(6, 0), pady=(6, 0)
+        )
+        ttk.Label(boost_grid, text="M205 J:").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Entry(boost_grid, textvariable=self._rt_boost_junction_var, width=8).grid(
+            row=2, column=1, sticky=tk.W, padx=(6, 0), pady=(6, 0)
+        )
+        boost_grid.grid_columnconfigure(1, weight=1)
 
         ttk.Button(right, text="Target = Current", command=self._rt_target_from_current).pack(
             side=tk.TOP, fill=tk.X, pady=(10, 0)
@@ -627,8 +671,9 @@ class PrinterGUI(tk.Tk):
     def _rt_target_from_current(self) -> None:
         if self._current_x is None or self._current_y is None:
             return
-        self._rt_target_x_var.set(float(self._current_x))
-        self._rt_target_y_var.set(float(self._current_y))
+        x_min, x_max, y_min, y_max, _z_min, _z_max = self._bed_bounds()
+        self._rt_target_x_var.set(self._clamp(float(self._current_x), x_min, x_max))
+        self._rt_target_y_var.set(self._clamp(float(self._current_y), y_min, y_max))
         if self._rt_virtual_x is None or self._rt_virtual_y is None:
             self._rt_virtual_x = float(self._current_x)
             self._rt_virtual_y = float(self._current_y)
@@ -756,6 +801,88 @@ class PrinterGUI(tk.Tk):
         except Exception:
             return float(default)
 
+    def _rt_apply_motion_boost(self) -> None:
+        if self._ser is None:
+            return
+        if self._worker is None:
+            return
+        if not bool(self._rt_boost_motion_var.get()):
+            return
+        if self._rt_boost_applied:
+            return
+
+        self._rt_boost_saved_m201_xy = (
+            self._config.max_accel_mm_s2.get("X"),
+            self._config.max_accel_mm_s2.get("Y"),
+        )
+        self._rt_boost_saved_m204 = self._config.accel_print_mm_s2
+        self._rt_boost_saved_junction = self._config.junction_deviation
+
+        m201_xy = int(round(self._rt_float(self._rt_boost_m201_xy_var.get(), default=3000.0)))
+        m201_xy = max(100, min(20000, m201_xy))
+        m204 = int(round(self._rt_float(self._rt_boost_m204_var.get(), default=3000.0)))
+        m204 = max(100, min(20000, m204))
+        junc = float(self._rt_float(self._rt_boost_junction_var.get(), default=0.2))
+        junc = max(0.0, min(2.0, junc))
+
+        # Apply only X/Y for M201 (do not touch Z settings).
+        self._send(f"M201 X{m201_xy} Y{m201_xy}", log=True, priority="high", tag="rt_boost_m201", timeout_s=3.0)
+        self._send(
+            f"M204 P{m204} R{m204} T{m204}",
+            log=True,
+            priority="high",
+            tag="rt_boost_m204",
+            timeout_s=3.0,
+        )
+        self._send(f"M205 J{junc:g}", log=True, priority="high", tag="rt_boost_m205", timeout_s=3.0)
+        self._rt_boost_applied = True
+
+    def _rt_restore_motion_boost(self) -> None:
+        if self._ser is None:
+            return
+        if self._worker is None:
+            return
+        if not self._rt_boost_applied:
+            return
+
+        x0y0 = self._rt_boost_saved_m201_xy
+        m204 = self._rt_boost_saved_m204
+        junc = self._rt_boost_saved_junction
+
+        if x0y0 is not None and (x0y0[0] is not None) and (x0y0[1] is not None):
+            self._send(
+                f"M201 X{float(x0y0[0]):g} Y{float(x0y0[1]):g}",
+                log=True,
+                priority="low",
+                tag="rt_restore_m201",
+                timeout_s=3.0,
+                interactive=False,
+            )
+        if m204 is not None:
+            v = int(round(float(m204)))
+            self._send(
+                f"M204 P{v} R{v} T{v}",
+                log=True,
+                priority="low",
+                tag="rt_restore_m204",
+                timeout_s=3.0,
+                interactive=False,
+            )
+        if junc is not None:
+            self._send(
+                f"M205 J{float(junc):g}",
+                log=True,
+                priority="low",
+                tag="rt_restore_m205",
+                timeout_s=3.0,
+                interactive=False,
+            )
+
+        self._rt_boost_applied = False
+        self._rt_boost_saved_m201_xy = None
+        self._rt_boost_saved_m204 = None
+        self._rt_boost_saved_junction = None
+
     def _rt_start(self) -> None:
         if self._ser is None:
             messagebox.showerror("Bed Realtime", "Not connected.")
@@ -773,6 +900,15 @@ class PrinterGUI(tk.Tk):
             )
             if not ok:
                 return
+            if bool(self._rt_home_xy_var.get()):
+                ok2 = messagebox.askokcancel(
+                    "Bed Realtime: Home X/Y",
+                    "Home X/Y on Start is enabled (G28 X Y).\n\n"
+                    "Note: some firmwares may raise Z slightly during homing, even when only X/Y are requested.\n\n"
+                    "Continue?",
+                )
+                if not ok2:
+                    return
 
         if self._rt_active:
             return
@@ -786,12 +922,22 @@ class PrinterGUI(tk.Tk):
         self._rt_mouse_inside = False
         self._rt_pending_acks = 0
         self._rt_pending_start = False
+        self._rt_queue_time_s = 0.0
+        self._rt_last_tick_time = time.monotonic()
 
         self._rt_restore_coord_mode = self._coord_mode_var.get()
         self._coord_mode_var.set("relative")
         self._send("G91", log=False, priority="high", tag="rt_g91", timeout_s=3.0, interactive=False)
 
-        if self._current_x is None or self._current_y is None:
+        if bool(self._rt_home_xy_var.get()):
+            self._rt_virtual_x = None
+            self._rt_virtual_y = None
+            self._rt_pending_start = True
+            self._send("G28 X Y", log=True, priority="high", tag="rt_g28_xy", timeout_s=120.0, interactive=False)
+            self._send("M400", log=False, priority="high", tag="rt_m400_home", timeout_s=300.0, interactive=False)
+            self._send("M114", log=False, priority="high", tag="rt_m114_start", timeout_s=3.0, interactive=False)
+            self._rt_status_var.set("Starting (homing X/Y)…")
+        elif self._current_x is None or self._current_y is None:
             self._rt_virtual_x = None
             self._rt_virtual_y = None
             self._rt_pending_start = True
@@ -803,6 +949,7 @@ class PrinterGUI(tk.Tk):
             self._rt_target_from_current()
             self._rt_status_var.set("Running")
 
+        self._rt_apply_motion_boost()
         self.after(0, self._rt_tick)
         self._redraw_rt_bed()
 
@@ -819,6 +966,10 @@ class PrinterGUI(tk.Tk):
         self._rt_mouse_inside = False
         self._rt_pending_acks = 0
         self._rt_status_var.set("Stopped")
+        self._rt_queue_time_s = 0.0
+        self._rt_last_tick_time = None
+
+        self._rt_restore_motion_boost()
 
         restore = self._rt_restore_coord_mode
         self._rt_restore_coord_mode = None
@@ -836,11 +987,22 @@ class PrinterGUI(tk.Tk):
         hz = max(1.0, min(100.0, hz))
         interval_ms = int(round(1000.0 / hz))
 
-        step_mm = self._rt_float(self._rt_step_mm_var.get(), default=1.0)
-        step_mm = max(0.01, min(20.0, step_mm))
+        step_cap_mm = self._rt_float(self._rt_step_mm_var.get(), default=1.0)
+        step_cap_mm = max(0.01, min(20.0, step_cap_mm))
 
         deadband = self._rt_float(self._rt_deadband_mm_var.get(), default=0.2)
         deadband = max(0.0, min(10.0, deadband))
+
+        buffer_ms = self._rt_float(self._rt_buffer_ms_var.get(), default=60.0)
+        buffer_ms = max(0.0, min(500.0, buffer_ms))
+        buffer_s = buffer_ms / 1000.0
+
+        now = time.monotonic()
+        if self._rt_last_tick_time is None:
+            self._rt_last_tick_time = now
+        elapsed = max(0.0, now - self._rt_last_tick_time)
+        self._rt_last_tick_time = now
+        self._rt_queue_time_s = max(0.0, float(self._rt_queue_time_s) - elapsed)
 
         # If we just started and didn't have a position yet, latch virtual position once M114 arrives.
         if (self._rt_virtual_x is None or self._rt_virtual_y is None) and self._current_x is not None and self._current_y is not None:
@@ -849,6 +1011,8 @@ class PrinterGUI(tk.Tk):
             self._rt_target_from_current()
             self._rt_pending_start = False
             self._rt_status_var.set("Running")
+
+        sync_each_tick = bool(self._rt_sync_m400_var.get())
 
         should_move = True
         if bool(self._rt_hold_mouse_var.get()) and (not self._rt_mouse_down):
@@ -862,8 +1026,10 @@ class PrinterGUI(tk.Tk):
             return
 
         # Avoid piling up commands if the printer stops responding.
-        if self._rt_pending_acks > 4:
-            self._rt_status_var.set(f"Running (backlog {self._rt_pending_acks})")
+        target_moves = max(1, int(math.ceil(max(buffer_s, 1.0 / hz) * hz)))
+        max_pending = max(6, target_moves + 8)
+        if self._rt_pending_acks > max_pending:
+            self._rt_status_var.set(f"Running (backlog {self._rt_pending_acks}, q≈{self._rt_queue_time_s*1000:.0f}ms)")
             self.after(interval_ms, self._rt_tick)
             return
 
@@ -873,74 +1039,108 @@ class PrinterGUI(tk.Tk):
             or self._rt_virtual_y is None
         ):
             if self._rt_virtual_x is None or self._rt_virtual_y is None:
-                self._rt_status_var.set("Running (waiting for position)…")
+                self._rt_status_var.set(f"Running (waiting for position, q≈{self._rt_queue_time_s*1000:.0f}ms)…")
             else:
-                self._rt_status_var.set("Running (idle)")
+                self._rt_status_var.set(f"Running (idle, q≈{self._rt_queue_time_s*1000:.0f}ms)")
             self.after(interval_ms, self._rt_tick)
             return
+
+        # For smooth motion, keep a small amount of motion queued (buffer_s).
+        # Too much buffer increases input lag; too little can cause planner starvation (choppiness).
+        desired_queue_s = max(buffer_s, 1.0 / hz)
+        if sync_each_tick:
+            desired_queue_s = 1.0 / hz
 
         x_min, x_max, y_min, y_max, _z_min, _z_max = self._bed_bounds()
-        vx = self._clamp(float(self._rt_virtual_x), x_min, x_max)
-        vy = self._clamp(float(self._rt_virtual_y), y_min, y_max)
-        self._rt_virtual_x, self._rt_virtual_y = vx, vy
+        v_max = max(1e-6, float(self._speed_xy_var.get()))
+        max_per_tick = min(step_cap_mm, v_max / hz)
 
-        tx = self._clamp(float(self._rt_target_x_var.get()), x_min, x_max)
-        ty = self._clamp(float(self._rt_target_y_var.get()), y_min, y_max)
-        self._rt_target_x_var.set(tx)
-        self._rt_target_y_var.set(ty)
+        segments_sent = 0
+        last_speed = 0.0
+        last_dist = 0.0
 
-        dx = tx - vx
-        dy = ty - vy
-        dist = math.hypot(dx, dy)
-        if dist <= deadband:
-            self._rt_status_var.set("Running (on target)")
-            self.after(interval_ms, self._rt_tick)
-            return
+        while self._rt_queue_time_s + 1e-9 < desired_queue_s:
+            vx = float(self._rt_virtual_x)
+            vy = float(self._rt_virtual_y)
 
-        if dist > step_mm:
-            scale = step_mm / dist
-            dx *= scale
-            dy *= scale
+            tx = self._clamp(float(self._rt_target_x_var.get()), x_min, x_max)
+            ty = self._clamp(float(self._rt_target_y_var.get()), y_min, y_max)
+            self._rt_target_x_var.set(tx)
+            self._rt_target_y_var.set(ty)
 
-        nx = self._clamp(vx + dx, x_min, x_max)
-        ny = self._clamp(vy + dy, y_min, y_max)
-        dx = nx - vx
-        dy = ny - vy
-        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
-            self._rt_status_var.set("Running (clamped)")
-            self.after(interval_ms, self._rt_tick)
-            return
+            dx = tx - vx
+            dy = ty - vy
+            dist = math.hypot(dx, dy)
+            last_dist = dist
+            if dist <= deadband:
+                break
 
-        speed = float(self._speed_xy_var.get())
-        feed = self._mm_s_to_mm_min(speed)
-        sent = self._send(
-            f"G0 X{dx:g} Y{dy:g} F{feed}",
-            log=False,
-            priority="high",
-            tag="rt_move",
-            timeout_s=10.0,
-            interactive=False,
-        )
-        if sent:
+            move_len = min(dist, max_per_tick)
+            if move_len <= 1e-9:
+                break
+
+            if dist > move_len:
+                scale = move_len / dist
+                dx *= scale
+                dy *= scale
+
+            nx = vx + dx
+            ny = vy + dy
+            actual_len = math.hypot(dx, dy)
+            if actual_len <= 1e-9:
+                break
+
+            speed = max(1e-6, min(v_max, actual_len * hz))
+            feed = max(1, self._mm_s_to_mm_min(speed))
+            sent = self._send(
+                f"G0 X{dx:g} Y{dy:g} F{feed}",
+                log=False,
+                priority="high",
+                tag="rt_move",
+                timeout_s=10.0,
+                interactive=False,
+            )
+            if not sent:
+                break
+
             self._rt_pending_acks += 1
-            if bool(self._rt_sync_m400_var.get()):
+            last_speed = speed
+            self._rt_virtual_x, self._rt_virtual_y = nx, ny
+            self._rt_queue_time_s += actual_len / speed
+            segments_sent += 1
+
+            if sync_each_tick:
                 if self._send("M400", log=False, priority="high", tag="rt_m400", timeout_s=300.0, interactive=False):
                     self._rt_pending_acks += 1
-            self._rt_virtual_x, self._rt_virtual_y = nx, ny
-            self._rt_status_var.set("Running (moving)")
+                break
+
+            if segments_sent >= 20:
+                break
+
+        if segments_sent > 0:
+            q_ms = self._rt_queue_time_s * 1000.0
+            self._rt_status_var.set(f"Running (v≈{last_speed:.0f} mm/s, q≈{q_ms:.0f}ms)")
+        elif last_dist <= deadband:
+            self._rt_status_var.set(f"Running (on target, q≈{self._rt_queue_time_s*1000:.0f}ms)")
         else:
-            self._rt_status_var.set("Running (send failed)")
+            self._rt_status_var.set(f"Running (idle, q≈{self._rt_queue_time_s*1000:.0f}ms)")
 
         self._redraw_rt_bed()
         self.after(interval_ms, self._rt_tick)
 
     def _bed_bounds(self) -> tuple[float, float, float, float, float, float]:
-        x_min = float(self._bed_x_min_var.get())
+        # Treat the UI bed/work area as 0..Xmax and 0..Ymax.
+        # Some firmwares report negative X/Y after homing (off-bed). The UI should not allow targeting those.
+        x_min = 0.0
         x_max = float(self._bed_x_max_var.get())
-        y_min = float(self._bed_y_min_var.get())
+        y_min = 0.0
         y_max = float(self._bed_y_max_var.get())
         z_min = float(self._bed_z_min_var.get())
         z_max = float(self._bed_z_max_var.get())
+        if float(self._bed_x_min_var.get()) != 0.0:
+            self._bed_x_min_var.set(0.0)
+        if float(self._bed_y_min_var.get()) != 0.0:
+            self._bed_y_min_var.set(0.0)
         if x_max <= x_min:
             x_max = x_min + 1.0
         if y_max <= y_min:
@@ -1296,6 +1496,10 @@ class PrinterGUI(tk.Tk):
             if self._startup_home_dialog is not None:
                 # Don't enqueue background polls while the startup dialog is active.
                 # This keeps homing/setup actions snappy and avoids interleaving.
+                self.after(int(interval_s * 1000), self._poll_tick)
+                return
+            if self._rt_active:
+                # Avoid injecting M105/M114 while realtime motion streaming is active.
                 self.after(int(interval_s * 1000), self._poll_tick)
                 return
             # Status polling: enqueue low-priority queries (one-at-a-time).
@@ -1769,7 +1973,7 @@ class PrinterGUI(tk.Tk):
         old_max_z = float(self._max_speed_z_var.get())
         old_speed_z = float(self._speed_z_var.get())
 
-        max_feed, accel_p = parse_m503(lines)
+        max_feed, accel_p, max_accel, junction_dev = parse_m503(lines)
         if max_feed:
             self._config.max_feedrate_mm_s.update(max_feed)
 
@@ -1783,6 +1987,12 @@ class PrinterGUI(tk.Tk):
             self._accel_var.set(float(int(round(accel_p))))
             self._update_accel_label()
 
+        if max_accel:
+            self._config.max_accel_mm_s2.update(max_accel)
+
+        if junction_dev is not None:
+            self._config.junction_deviation = junction_dev
+
         # Keep the Z speed at max when the user hasn't changed it.
         new_max_z = float(self._max_speed_z_var.get())
         if abs(old_speed_z - old_max_z) < 1e-6:
@@ -1790,13 +2000,19 @@ class PrinterGUI(tk.Tk):
 
         self._apply_speed_limits()
 
-        if max_feed or (accel_p is not None):
+        if max_feed or (accel_p is not None) or max_accel or (junction_dev is not None):
             x_v = self._config.max_feedrate_mm_s.get("X")
             y_v = self._config.max_feedrate_mm_s.get("Y")
             z_v = self._config.max_feedrate_mm_s.get("Z")
             msg = f"[config] Firmware max axis feedrates (M203, mm/s): X={x_v} Y={y_v} Z={z_v}"
             if accel_p is not None:
                 msg += f" | Accel P={accel_p}"
+            if max_accel:
+                ax = self._config.max_accel_mm_s2.get("X")
+                ay = self._config.max_accel_mm_s2.get("Y")
+                msg += f" | Max accel (M201, mm/s^2): X={ax} Y={ay}"
+            if junction_dev is not None:
+                msg += f" | Junction dev (M205 J)={junction_dev}"
             self._append_log(msg)
 
     @staticmethod
@@ -2279,6 +2495,7 @@ class PrinterGUI(tk.Tk):
         self._rt_mouse_down = False
         self._rt_mouse_inside = False
         self._rt_status_var.set("Stopped (disconnected)")
+        self._rt_restore_motion_boost()
         if hasattr(self, "rt_start_btn"):
             self.rt_start_btn.configure(state="normal")
         if hasattr(self, "rt_stop_btn"):

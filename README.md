@@ -30,12 +30,21 @@ Controls:
 
 - **Start / Stop**: starts/stops streaming. While running, the UI switches the printer to relative mode (G91) and restores your previous mode on stop.
 - **Hold left mouse to move**: when enabled (default), the printer only moves while you hold the left mouse button on the canvas.
+- **Home X/Y on Start (G28 X Y)**: optional. Note: some firmwares may raise Z slightly during homing even when only X/Y are requested.
 - **Tick (Hz)**: update rate. Typical starting range: 20–60 Hz.
-- **Max step (mm)**: maximum distance per tick.
+- **Max step/tick (mm)**: maximum distance per tick.
 - **Deadband (mm)**: don’t move when already close to target (reduces jitter).
+- **Buffer (ms)**: small lookahead queue (reduces choppiness). Lower = more responsive, higher = smoother but more input lag.
 - **Sync each tick (M400)**: waits for moves to finish each tick. This reduces “queued lag” but can feel steppy and limits max tick rate.
+- **Motion Boost (optional)**: temporarily applies `M201`/`M204`/`M205 J` while running (helps short-segment motion), then restores values on stop.
 
 Tuning tip:
 
-- Approx commanded XY speed is `tick_hz * step_mm`. For example: `40 Hz * 1.0 mm ≈ 40 mm/s`.
+- Effective XY speed is approximately `min(SpeedXY, tick_hz * step_mm)`. For example: `40 Hz * 1.0 mm ≈ 40 mm/s`.
+- If it’s choppy with tiny steps, increase **Max step/tick** and/or **Tick (Hz)**, or enable **Motion Boost**.
 
+## Benchmarking (optional)
+
+If you want to measure how fast your firmware acknowledges small moves:
+
+- `conda run -n 3dprinter python tools/rt_bench.py --port /dev/cu.wchusbserial1120 --dx 0.5 --feed 6000 --count 80`
