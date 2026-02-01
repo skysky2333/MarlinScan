@@ -933,8 +933,11 @@ class PrinterGUI(tk.Tk):
             self._rt_virtual_x = None
             self._rt_virtual_y = None
             self._rt_pending_start = True
+            self._rt_target_x_var.set(0.0)
+            self._rt_target_y_var.set(0.0)
             self._send("G28 X Y", log=True, priority="high", tag="rt_g28_xy", timeout_s=120.0, interactive=False)
             self._send("M400", log=False, priority="high", tag="rt_m400_home", timeout_s=300.0, interactive=False)
+            self._send("G91", log=False, priority="high", tag="rt_g91_post_home", timeout_s=3.0, interactive=False)
             self._send("M114", log=False, priority="high", tag="rt_m114_start", timeout_s=3.0, interactive=False)
             self._rt_status_var.set("Starting (homing X/Y)…")
         elif self._current_x is None or self._current_y is None:
@@ -1004,14 +1007,6 @@ class PrinterGUI(tk.Tk):
         self._rt_last_tick_time = now
         self._rt_queue_time_s = max(0.0, float(self._rt_queue_time_s) - elapsed)
 
-        # If we just started and didn't have a position yet, latch virtual position once M114 arrives.
-        if (self._rt_virtual_x is None or self._rt_virtual_y is None) and self._current_x is not None and self._current_y is not None:
-            self._rt_virtual_x = float(self._current_x)
-            self._rt_virtual_y = float(self._current_y)
-            self._rt_target_from_current()
-            self._rt_pending_start = False
-            self._rt_status_var.set("Running")
-
         sync_each_tick = bool(self._rt_sync_m400_var.get())
 
         should_move = True
@@ -1039,7 +1034,8 @@ class PrinterGUI(tk.Tk):
             or self._rt_virtual_y is None
         ):
             if self._rt_virtual_x is None or self._rt_virtual_y is None:
-                self._rt_status_var.set(f"Running (waiting for position, q≈{self._rt_queue_time_s*1000:.0f}ms)…")
+                prefix = "Starting" if self._rt_pending_start else "Running"
+                self._rt_status_var.set(f"{prefix} (waiting for position, q≈{self._rt_queue_time_s*1000:.0f}ms)…")
             else:
                 self._rt_status_var.set(f"Running (idle, q≈{self._rt_queue_time_s*1000:.0f}ms)")
             self.after(interval_ms, self._rt_tick)
@@ -1572,10 +1568,28 @@ class PrinterGUI(tk.Tk):
 
         if job.tag in {"rt_move", "rt_m400"} and self._rt_pending_acks > 0:
             self._rt_pending_acks -= 1
-        if job.tag == "rt_m114_start" and (not ok):
-            self._rt_pending_start = False
-            self._rt_active = False
-            self._rt_status_var.set("Stopped (M114 failed)")
+        if job.tag == "rt_m114_start":
+            if not ok:
+                self._rt_pending_start = False
+                self._rt_active = False
+                self._rt_status_var.set("Stopped (M114 failed)")
+            elif self._rt_active and self._rt_pending_start:
+                for line in lines:
+                    if line.lstrip().lower().startswith("count"):
+                        continue
+                    pos = parse_m114(line)
+                    if pos is None:
+                        continue
+                    x, y, _z, _e = pos
+                    if x is None or y is None:
+                        continue
+                    self._rt_virtual_x = float(x)
+                    self._rt_virtual_y = float(y)
+                    self._rt_target_from_current()
+                    self._rt_pending_start = False
+                    self._rt_status_var.set("Running")
+                    self._redraw_rt_bed()
+                    break
 
         if job.tag == "poll_m105":
             self._poll_pending_m105 = False
