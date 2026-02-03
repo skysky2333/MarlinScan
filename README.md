@@ -58,6 +58,8 @@ The **Move** tab also has **Realtime Keyboard** controls that stream short relat
 
 This uses the same idea as Bed Realtime: tune **Tick (Hz)** and **Buffer (ms)** for responsiveness vs smoothness.
 
+The startup **Homing / Coordinate Setup** dialog also includes a **Manual Positioning (Keyboard Jog)** section that uses the same controls.
+
 ## Benchmarking (optional)
 
 If you want to measure how fast your firmware acknowledges small moves:

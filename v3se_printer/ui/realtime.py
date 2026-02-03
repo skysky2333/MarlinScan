@@ -672,30 +672,42 @@ class RealtimeMixin:
         self._kb_keys_down.discard(key)
         return "break"
 
-    def _kb_install_bindings(self) -> None:
+    def _kb_install_bindings(self, bind_widget: tk.Misc | None = None) -> None:
         if getattr(self, "_kb_bind_press_id", None) is not None:
             return
+        widget = self if bind_widget is None else bind_widget
+        self._kb_bind_widget = widget
         try:
-            self._kb_bind_press_id = self.bind("<KeyPress>", self._kb_on_key_press, add="+")
-            self._kb_bind_release_id = self.bind("<KeyRelease>", self._kb_on_key_release, add="+")
+            self._kb_bind_press_id = widget.bind("<KeyPress>", self._kb_on_key_press, add="+")
+            self._kb_bind_release_id = widget.bind("<KeyRelease>", self._kb_on_key_release, add="+")
         except Exception:
             self._kb_bind_press_id = None
             self._kb_bind_release_id = None
+            self._kb_bind_widget = None
 
     def _kb_remove_bindings(self) -> None:
         press_id = getattr(self, "_kb_bind_press_id", None)
         release_id = getattr(self, "_kb_bind_release_id", None)
+        widget: tk.Misc = self if getattr(self, "_kb_bind_widget", None) is None else self._kb_bind_widget
         try:
             if press_id:
-                self.unbind("<KeyPress>", press_id)
+                widget.unbind("<KeyPress>", press_id)
             if release_id:
-                self.unbind("<KeyRelease>", release_id)
+                widget.unbind("<KeyRelease>", release_id)
         except Exception:
             pass
         self._kb_bind_press_id = None
         self._kb_bind_release_id = None
+        self._kb_bind_widget = None
 
-    def _kb_start(self) -> None:
+    def _kb_start(
+        self,
+        *,
+        bind_widget: tk.Misc | None = None,
+        enforce_bounds: bool = True,
+        speed_xy_cap: float | None = None,
+        speed_z_cap: float | None = None,
+    ) -> None:
         if self._ser is None:
             messagebox.showerror("Realtime Keyboard", "Not connected.")
             return
@@ -718,6 +730,10 @@ class RealtimeMixin:
             if not ok:
                 return
 
+        self._kb_enforce_bounds = bool(enforce_bounds)
+        self._kb_speed_xy_cap = speed_xy_cap
+        self._kb_speed_z_cap = speed_z_cap
+
         self._kb_active = True
         self._kb_pending_start = True
         self._kb_pending_acks = 0
@@ -733,9 +749,10 @@ class RealtimeMixin:
         if hasattr(self, "kb_stop_btn"):
             self.kb_stop_btn.configure(state="normal")
 
-        # Prefer keeping focus on the main window so arrow keys don't get consumed by Entry widgets.
+        # Prefer keeping focus on the active window so arrow keys don't get consumed by Entry widgets.
+        self._kb_bind_widget = self if bind_widget is None else bind_widget
         try:
-            self.focus_set()
+            self._kb_bind_widget.focus_set()
         except Exception:
             pass
 
@@ -743,15 +760,15 @@ class RealtimeMixin:
         self._coord_mode_var.set("relative")
         self._send("G91", log=False, priority="high", tag="kb_g91", timeout_s=3.0, interactive=False)
 
-        # Ensure we have an up-to-date position snapshot for bounds.
+        # Ensure we have an up-to-date position snapshot (used for bounds and for a quick UI refresh).
         self._send("M114", log=False, priority="high", tag="kb_m114_start", timeout_s=3.0, interactive=False)
         self._kb_status_var.set("Starting (waiting for M114)…")
 
         # Optional motion boost (shared settings with Bed Realtime).
         self._rt_apply_motion_boost()
 
-        # Install key listeners (bind on the root so we don't clobber other future bind_all handlers).
-        self._kb_install_bindings()
+        # Install key listeners on the active top-level (root or startup dialog).
+        self._kb_install_bindings(self._kb_bind_widget)
 
         self.after(0, self._kb_tick)
 
@@ -811,10 +828,10 @@ class RealtimeMixin:
             self._kb_active = False
             return
 
-        # Keep focus on the main window so arrow keys are reliably captured.
-        if self._kb_keys_down:
+        # Keep focus on the active window so arrow keys are reliably captured.
+        if self._kb_keys_down and getattr(self, "_kb_bind_widget", None) is not None:
             try:
-                self.focus_set()
+                self._kb_bind_widget.focus_set()
             except Exception:
                 pass
 
@@ -828,11 +845,26 @@ class RealtimeMixin:
             self.after(interval_ms, self._kb_tick)
             return
 
-        # Need an initial position to enforce bounds.
-        if self._kb_pending_start or self._kb_virtual_x is None or self._kb_virtual_y is None or self._kb_virtual_z is None:
-            self._kb_status_var.set(f"Starting (waiting for position, q≈{self._kb_queue_time_s*1000:.0f}ms)…")
-            self.after(interval_ms, self._kb_tick)
-            return
+        enforce_bounds = bool(getattr(self, "_kb_enforce_bounds", True))
+        if enforce_bounds:
+            # Need an initial position to enforce bounds.
+            if (
+                self._kb_pending_start
+                or self._kb_virtual_x is None
+                or self._kb_virtual_y is None
+                or self._kb_virtual_z is None
+            ):
+                self._kb_status_var.set(f"Starting (waiting for position, q≈{self._kb_queue_time_s*1000:.0f}ms)…")
+                self.after(interval_ms, self._kb_tick)
+                return
+        else:
+            # Startup/manual homing: allow jogging even without a position snapshot (bounds are meaningless).
+            if self._kb_virtual_x is None:
+                self._kb_virtual_x = 0.0
+            if self._kb_virtual_y is None:
+                self._kb_virtual_y = 0.0
+            if self._kb_virtual_z is None:
+                self._kb_virtual_z = 0.0
 
         dx_dir = (1 if "Right" in self._kb_keys_down else 0) + (-1 if "Left" in self._kb_keys_down else 0)
         dy_dir = (1 if "Up" in self._kb_keys_down else 0) + (-1 if "Down" in self._kb_keys_down else 0)
@@ -848,10 +880,26 @@ class RealtimeMixin:
         if sync_each_tick:
             desired_queue_s = dt
 
-        x_min, x_max, y_min, y_max, z_min, z_max = self._bed_bounds()
+        if enforce_bounds:
+            x_min, x_max, y_min, y_max, z_min, z_max = self._bed_bounds()
+        else:
+            x_min = y_min = z_min = float("-inf")
+            x_max = y_max = z_max = float("inf")
 
         v_xy = max(1e-6, float(self._speed_xy_var.get()))
         v_z = max(1e-6, float(self._speed_z_var.get()))
+        xy_cap = getattr(self, "_kb_speed_xy_cap", None)
+        if xy_cap is not None:
+            try:
+                v_xy = min(v_xy, max(1e-6, float(xy_cap)))
+            except Exception:
+                pass
+        z_cap = getattr(self, "_kb_speed_z_cap", None)
+        if z_cap is not None:
+            try:
+                v_z = min(v_z, max(1e-6, float(z_cap)))
+            except Exception:
+                pass
 
         segments_sent = 0
         last_speed = 0.0
@@ -1003,6 +1051,7 @@ class RealtimeMixin:
         self._kb_queue_time_s = 0.0
         self._kb_last_tick_time = None
         self._kb_remove_bindings()
+        self._kb_bind_widget = None
         if hasattr(self, "kb_start_btn"):
             self.kb_start_btn.configure(state="normal")
         if hasattr(self, "kb_stop_btn"):
@@ -1024,4 +1073,3 @@ class RealtimeMixin:
         if hasattr(self, "rt_stop_btn"):
             self.rt_stop_btn.configure(state="disabled")
         self._rt_request_redraw(force=True)
-

@@ -74,7 +74,9 @@ class MaintTabMixin:
         if self._startup_home_dialog is None:
             return
 
-        busy = self._startup_home_pending_jobs > 0
+        busy_jobs = self._startup_home_pending_jobs > 0
+        busy_kb = bool(getattr(self, "_kb_active", False)) or bool(getattr(self, "_kb_pending_start", False))
+        busy = busy_jobs or busy_kb
         for btn in self._startup_home_buttons:
             try:
                 btn.configure(state=("disabled" if busy else "normal"))
@@ -86,6 +88,13 @@ class MaintTabMixin:
             self._startup_home_continue_btn.configure(state=("normal" if (done and (not busy)) else "disabled"))
         if done and (not busy):
             self._startup_home_status_var.set("All axes are set. Click Continue.")
+
+        start_btn = getattr(self, "_startup_kb_start_btn", None)
+        stop_btn = getattr(self, "_startup_kb_stop_btn", None)
+        if start_btn is not None:
+            start_btn.configure(state=("disabled" if busy else "normal"))
+        if stop_btn is not None:
+            stop_btn.configure(state=("normal" if busy_kb else "disabled"))
 
     def _startup_home_continue(self) -> None:
         if self._startup_home_dialog is None:
@@ -101,6 +110,9 @@ class MaintTabMixin:
             )
             return
 
+        if bool(getattr(self, "_kb_active", False)) or bool(getattr(self, "_kb_pending_start", False)):
+            self._kb_stop()
+
         self._home_prompt_pending = False
         if self._deferred_m503 and self._ser is not None:
             # Safe to do now; do not block the startup homing actions.
@@ -112,6 +124,8 @@ class MaintTabMixin:
             self._startup_home_dialog = None
             self._startup_home_continue_btn = None
             self._startup_home_buttons = []
+            self._startup_kb_start_btn = None
+            self._startup_kb_stop_btn = None
 
     def _startup_home_handle_job_done(self, job: GCodeJob, ok: bool) -> None:
         if self._startup_home_dialog is None:
@@ -230,6 +244,8 @@ class MaintTabMixin:
         dlg.resizable(False, False)
 
         def disconnect() -> None:
+            if bool(getattr(self, "_kb_active", False)) or bool(getattr(self, "_kb_pending_start", False)):
+                self._kb_stop()
             try:
                 dlg.destroy()
             finally:
@@ -259,8 +275,39 @@ class MaintTabMixin:
         motors.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(10, 0))
         ttk.Label(motors, textvariable=self._startup_home_motors_var, width=16).pack(side=tk.LEFT)
 
+        kb = ttk.LabelFrame(body, text="Manual Positioning (Keyboard Jog)", padding=10)
+        kb.grid(row=3, column=0, columnspan=4, sticky=tk.W + tk.E, pady=(10, 0))
+        ttk.Label(
+            kb,
+            text=(
+                "Use this to move before choosing Manual X/Y/Z=0.\n"
+                "Controls: Arrow keys = X/Y, Shift = Z+, Control = Z-."
+            ),
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=4, sticky=tk.W)
+
+        kb_btns = ttk.Frame(kb)
+        kb_btns.grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+
+        def start_kb() -> None:
+            self._kb_start(bind_widget=dlg, enforce_bounds=False, speed_xy_cap=30.0, speed_z_cap=2.0)
+            self._startup_home_update_controls()
+
+        def stop_kb() -> None:
+            self._kb_stop()
+            self._startup_home_update_controls()
+
+        self._startup_kb_start_btn = ttk.Button(kb_btns, text="Start Jog", command=start_kb)
+        self._startup_kb_start_btn.grid(row=0, column=0, sticky=tk.W)
+        self._startup_kb_stop_btn = ttk.Button(kb_btns, text="Stop Jog", command=stop_kb, state="disabled")
+        self._startup_kb_stop_btn.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
+        ttk.Label(kb, textvariable=self._kb_status_var).grid(
+            row=1, column=1, columnspan=3, sticky=tk.W, padx=(10, 0), pady=(8, 0)
+        )
+        kb.grid_columnconfigure(0, weight=1)
+
         hdr = ttk.Frame(body)
-        hdr.grid(row=3, column=0, columnspan=4, sticky=tk.W, pady=(10, 0))
+        hdr.grid(row=4, column=0, columnspan=4, sticky=tk.W, pady=(10, 0))
         ttk.Label(hdr, text="Axis", width=6).grid(row=0, column=0, sticky=tk.W)
         ttk.Label(hdr, text="Status", width=16).grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
         ttk.Label(hdr, text="Actions").grid(row=0, column=2, sticky=tk.W, padx=(10, 0))
@@ -272,6 +319,8 @@ class MaintTabMixin:
                 return
             if self._startup_home_pending_jobs > 0:
                 return
+            if bool(getattr(self, "_kb_active", False)) or bool(getattr(self, "_kb_pending_start", False)):
+                self._kb_stop()
 
             cmd = "M17" if enable else "M84"
             tag = "startup_motors:on" if enable else "startup_motors:off"
@@ -297,6 +346,8 @@ class MaintTabMixin:
                 return
             if self._startup_home_pending_jobs > 0:
                 return
+            if bool(getattr(self, "_kb_active", False)) or bool(getattr(self, "_kb_pending_start", False)):
+                self._kb_stop()
 
             mode = mode.lower().strip()
             axis = axis.upper().strip()
@@ -357,7 +408,7 @@ class MaintTabMixin:
                 self._startup_home_update_controls()
 
         for i, axis in enumerate(("X", "Y", "Z"), start=0):
-            r = 4 + i
+            r = 5 + i
             ttk.Label(body, text=axis, width=6).grid(row=r, column=0, sticky=tk.W, pady=(8, 0))
             ttk.Label(body, textvariable=self._startup_home_axis_vars[axis], width=16).grid(
                 row=r, column=1, sticky=tk.W, padx=(10, 0), pady=(8, 0)
@@ -372,7 +423,7 @@ class MaintTabMixin:
             self._startup_home_buttons.extend([auto_btn, manual_btn])
 
         bottom = ttk.Frame(body)
-        bottom.grid(row=7, column=0, columnspan=4, sticky=tk.E, pady=(14, 0))
+        bottom.grid(row=8, column=0, columnspan=4, sticky=tk.E, pady=(14, 0))
 
         auto_all_btn = ttk.Button(bottom, text="Auto All", command=lambda: send_startup_home("auto", "ALL"))
         auto_all_btn.pack(side=tk.LEFT, padx=(0, 8))
@@ -391,4 +442,3 @@ class MaintTabMixin:
 
         dlg.bind("<Escape>", lambda _e: disconnect())
         self._startup_home_update_controls()
-

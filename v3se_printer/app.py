@@ -212,10 +212,14 @@ class PrinterGUI(
         self._kb_sync_m400_var = tk.BooleanVar(value=False)
         self._kb_buffer_ms_var = tk.StringVar(value="30")
         self._kb_status_var = tk.StringVar(value="Stopped")
+        self._kb_enforce_bounds = True
+        self._kb_speed_xy_cap: float | None = None
+        self._kb_speed_z_cap: float | None = None
 
         # Internal binding/paint bookkeeping for realtime modes.
         self._kb_bind_press_id: str | None = None
         self._kb_bind_release_id: str | None = None
+        self._kb_bind_widget: tk.Misc | None = None
         self._rt_redraw_after_id: str | None = None
         self._rt_last_redraw_time: float | None = None
 
@@ -934,4 +938,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
