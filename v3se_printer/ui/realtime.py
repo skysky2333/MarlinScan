@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -151,6 +152,12 @@ class RealtimeMixin:
         x_min, x_max, y_min, y_max, _z_min, _z_max = self._bed_bounds()
         self._rt_target_x_var.set(self._clamp(float(self._current_x), x_min, x_max))
         self._rt_target_y_var.set(self._clamp(float(self._current_y), y_min, y_max))
+        try:
+            with getattr(self, "_rt_loop_lock"):
+                self._rt_loop_target_x = float(self._rt_target_x_var.get())
+                self._rt_loop_target_y = float(self._rt_target_y_var.get())
+        except Exception:
+            pass
         if self._rt_virtual_x is None or self._rt_virtual_y is None:
             self._rt_virtual_x = float(self._current_x)
             self._rt_virtual_y = float(self._current_y)
@@ -280,6 +287,12 @@ class RealtimeMixin:
         y = self._clamp(y, y_min, y_max)
         self._rt_target_x_var.set(x)
         self._rt_target_y_var.set(y)
+        try:
+            with getattr(self, "_rt_loop_lock"):
+                self._rt_loop_target_x = float(x)
+                self._rt_loop_target_y = float(y)
+        except Exception:
+            pass
         self._rt_mouse_inside = True
         self._rt_request_redraw()
 
@@ -458,12 +471,13 @@ class RealtimeMixin:
             self._rt_status_var.set("Running")
 
         self._rt_apply_motion_boost()
-        self.after(0, self._rt_tick)
+        self._rt_loop_start()
         self._rt_request_redraw(force=True)
 
     def _rt_stop(self) -> None:
         if not self._rt_active and not self._rt_pending_start:
             return
+        self._rt_loop_stop()
         self._rt_active = False
         if hasattr(self, "rt_start_btn"):
             self.rt_start_btn.configure(state="normal")
@@ -486,6 +500,293 @@ class RealtimeMixin:
             self.apply_coord_mode()
 
         self._rt_request_redraw(force=True)
+
+    def _rt_loop_start(self) -> None:
+        if getattr(self, "_worker", None) is None:
+            return
+
+        if getattr(self, "_rt_loop_lock", None) is None:
+            self._rt_loop_lock = threading.Lock()
+            self._rt_loop_stop_evt = threading.Event()
+            self._rt_loop_thread = None
+            self._rt_loop_params: dict[str, float | bool] = {}
+            self._rt_loop_target_x: float | None = None
+            self._rt_loop_target_y: float | None = None
+            self._rt_loop_params_after_id = None
+
+        self._rt_loop_stop_evt.clear()
+        self._rt_loop_refresh_params()
+        self._rt_loop_params_schedule()
+
+        t = getattr(self, "_rt_loop_thread", None)
+        if t is None or (not t.is_alive()):
+            self._rt_loop_thread = threading.Thread(target=self._rt_loop_worker, daemon=True)
+            self._rt_loop_thread.start()
+
+    def _rt_loop_stop(self) -> None:
+        try:
+            after_id = getattr(self, "_rt_loop_params_after_id", None)
+            if after_id is not None:
+                self.after_cancel(after_id)
+        except Exception:
+            pass
+        try:
+            self._rt_loop_params_after_id = None
+        except Exception:
+            pass
+
+        try:
+            getattr(self, "_rt_loop_stop_evt").set()
+        except Exception:
+            pass
+
+    def _rt_loop_params_schedule(self) -> None:
+        try:
+            after_id = getattr(self, "_rt_loop_params_after_id", None)
+            if after_id is not None:
+                self.after_cancel(after_id)
+        except Exception:
+            pass
+
+        def _tick() -> None:
+            self._rt_loop_params_after_id = None
+            if not getattr(self, "_rt_active", False):
+                return
+            self._rt_loop_refresh_params()
+            self._rt_loop_params_after_id = self.after(200, _tick)
+
+        try:
+            self._rt_loop_params_after_id = self.after(200, _tick)
+        except Exception:
+            self._rt_loop_params_after_id = None
+
+    def _rt_loop_refresh_params(self) -> None:
+        # Must be called on the UI thread (reads Tk variables).
+        hz = self._rt_float(self._rt_tick_hz_var.get(), default=40.0)
+        hz = max(1.0, min(100.0, hz))
+        step_cap_mm = self._rt_float(self._rt_step_mm_var.get(), default=1.0)
+        step_cap_mm = max(0.01, min(20.0, step_cap_mm))
+        deadband = self._rt_float(self._rt_deadband_mm_var.get(), default=0.2)
+        deadband = max(0.0, min(10.0, deadband))
+        buffer_ms = self._rt_float(self._rt_buffer_ms_var.get(), default=60.0)
+        buffer_ms = max(0.0, min(500.0, buffer_ms))
+        buffer_s = buffer_ms / 1000.0
+        sync_each_tick = bool(self._rt_sync_m400_var.get())
+        hold_mouse = bool(self._rt_hold_mouse_var.get())
+
+        x_min, x_max, y_min, y_max, _z_min, _z_max = self._bed_bounds()
+        try:
+            v_max = max(1e-6, float(self._speed_xy_var.get()))
+        except Exception:
+            v_max = 150.0
+
+        try:
+            tx = float(self._rt_target_x_var.get())
+            ty = float(self._rt_target_y_var.get())
+        except Exception:
+            tx, ty = 0.0, 0.0
+
+        with getattr(self, "_rt_loop_lock"):
+            self._rt_loop_params = {
+                "hz": float(hz),
+                "step_cap_mm": float(step_cap_mm),
+                "deadband": float(deadband),
+                "buffer_s": float(buffer_s),
+                "sync_each_tick": bool(sync_each_tick),
+                "hold_mouse": bool(hold_mouse),
+                "x_min": float(x_min),
+                "x_max": float(x_max),
+                "y_min": float(y_min),
+                "y_max": float(y_max),
+                "v_max": float(v_max),
+            }
+            self._rt_loop_target_x = float(tx)
+            self._rt_loop_target_y = float(ty)
+
+    def _rt_loop_worker(self) -> None:
+        last_emit = 0.0
+        last_status = ""
+        while True:
+            try:
+                if getattr(self, "_rt_loop_stop_evt").is_set():
+                    return
+            except Exception:
+                return
+
+            with getattr(self, "_rt_loop_lock"):
+                active = bool(getattr(self, "_rt_active", False))
+                pending_start = bool(getattr(self, "_rt_pending_start", False))
+                pending_acks = int(getattr(self, "_rt_pending_acks", 0))
+                queue_time_s = float(getattr(self, "_rt_queue_time_s", 0.0))
+                last_tick = getattr(self, "_rt_last_tick_time", None)
+                vx = getattr(self, "_rt_virtual_x", None)
+                vy = getattr(self, "_rt_virtual_y", None)
+                mouse_down = bool(getattr(self, "_rt_mouse_down", False))
+                mouse_inside = bool(getattr(self, "_rt_mouse_inside", False))
+                params = dict(getattr(self, "_rt_loop_params", {}))
+                tx = getattr(self, "_rt_loop_target_x", None)
+                ty = getattr(self, "_rt_loop_target_y", None)
+
+            if not active:
+                return
+
+            # If printer disconnects, the UI cleanup will stop the loop.
+            if getattr(self, "_worker", None) is None or getattr(self, "_ser", None) is None:
+                return
+
+            hz = float(params.get("hz", 40.0))
+            hz = max(1.0, min(100.0, hz))
+            interval_s = 1.0 / hz
+            step_cap_mm = float(params.get("step_cap_mm", 1.0))
+            deadband = float(params.get("deadband", 0.2))
+            buffer_s = float(params.get("buffer_s", 0.06))
+            sync_each_tick = bool(params.get("sync_each_tick", False))
+            hold_mouse = bool(params.get("hold_mouse", True))
+            x_min = float(params.get("x_min", 0.0))
+            x_max = float(params.get("x_max", 220.0))
+            y_min = float(params.get("y_min", 0.0))
+            y_max = float(params.get("y_max", 220.0))
+            v_max = max(1e-6, float(params.get("v_max", 150.0)))
+
+            should_move = True
+            if hold_mouse and (not mouse_down):
+                should_move = False
+            if not mouse_inside:
+                should_move = False
+
+            now = time.monotonic()
+            if last_tick is None:
+                last_tick = now
+            elapsed = max(0.0, now - float(last_tick))
+            last_tick = now
+            queue_time_s = max(0.0, float(queue_time_s) - float(elapsed))
+
+            def emit(status: str) -> None:
+                nonlocal last_emit, last_status
+                t_now = time.monotonic()
+                if status == last_status and (t_now - last_emit) < 0.5:
+                    return
+                last_status = status
+                last_emit = t_now
+                try:
+                    self._events.put(("rt-status", status))
+                except Exception:
+                    pass
+
+            # Backpressure: don't queue unbounded commands if the printer stops responding.
+            target_moves = max(1, int(math.ceil(max(buffer_s, 1.0 / hz) * hz)))
+            max_pending = max(6, target_moves + 8)
+            if pending_acks > max_pending:
+                emit(f"Running (backlog {pending_acks}, q≈{queue_time_s*1000:.0f}ms)")
+                with getattr(self, "_rt_loop_lock"):
+                    self._rt_queue_time_s = float(queue_time_s)
+                    self._rt_last_tick_time = float(last_tick)
+                time.sleep(interval_s)
+                continue
+
+            if (not should_move) or vx is None or vy is None or tx is None or ty is None:
+                if vx is None or vy is None:
+                    prefix = "Starting" if pending_start else "Running"
+                    emit(f"{prefix} (waiting for position, q≈{queue_time_s*1000:.0f}ms)…")
+                else:
+                    emit(f"Running (idle, q≈{queue_time_s*1000:.0f}ms)")
+                with getattr(self, "_rt_loop_lock"):
+                    self._rt_queue_time_s = float(queue_time_s)
+                    self._rt_last_tick_time = float(last_tick)
+                time.sleep(interval_s)
+                continue
+
+            desired_queue_s = max(buffer_s, 1.0 / hz)
+            if sync_each_tick:
+                desired_queue_s = 1.0 / hz
+
+            max_per_tick = min(step_cap_mm, v_max / hz)
+            segments_sent = 0
+            last_speed = 0.0
+            last_dist = 0.0
+
+            vx_f = float(vx)
+            vy_f = float(vy)
+            tx_f = self._clamp(float(tx), x_min, x_max)
+            ty_f = self._clamp(float(ty), y_min, y_max)
+
+            while float(queue_time_s) + 1e-9 < float(desired_queue_s):
+                if getattr(self, "_rt_loop_stop_evt").is_set() or (not getattr(self, "_rt_active", False)):
+                    return
+
+                dx = float(tx_f) - float(vx_f)
+                dy = float(ty_f) - float(vy_f)
+                dist = math.hypot(dx, dy)
+                last_dist = dist
+                if dist <= float(deadband):
+                    break
+
+                move_len = min(dist, max_per_tick)
+                if move_len <= 1e-9:
+                    break
+                if dist > move_len:
+                    scale = move_len / dist
+                    dx *= scale
+                    dy *= scale
+
+                nx = float(vx_f) + float(dx)
+                ny = float(vy_f) + float(dy)
+                actual_len = math.hypot(dx, dy)
+                if actual_len <= 1e-9:
+                    break
+
+                speed = max(1e-6, min(v_max, actual_len * hz))
+                feed = max(1, self._mm_s_to_mm_min(speed))
+                sent = self._send(
+                    f"G0 X{dx:g} Y{dy:g} F{feed}",
+                    log=False,
+                    priority="high",
+                    tag="rt_move",
+                    timeout_s=10.0,
+                    interactive=False,
+                )
+                if not sent:
+                    break
+
+                pending_acks += 1
+                last_speed = float(speed)
+                vx_f, vy_f = float(nx), float(ny)
+                queue_time_s += actual_len / speed
+                segments_sent += 1
+
+                if sync_each_tick:
+                    if self._send(
+                        "M400", log=False, priority="high", tag="rt_m400", timeout_s=300.0, interactive=False
+                    ):
+                        pending_acks += 1
+                    break
+
+                if segments_sent >= 20:
+                    break
+
+            with getattr(self, "_rt_loop_lock"):
+                self._rt_virtual_x = float(vx_f)
+                self._rt_virtual_y = float(vy_f)
+                self._rt_pending_acks = int(pending_acks)
+                self._rt_queue_time_s = float(queue_time_s)
+                self._rt_last_tick_time = float(last_tick)
+
+            if segments_sent > 0:
+                q_ms = float(queue_time_s) * 1000.0
+                emit(f"Running (v≈{last_speed:.0f} mm/s, q≈{q_ms:.0f}ms)")
+                try:
+                    self._events.put(("rt-redraw", None))
+                except Exception:
+                    pass
+            elif last_dist <= float(deadband):
+                emit(f"Running (on target, q≈{queue_time_s*1000:.0f}ms)")
+            else:
+                emit(f"Running (idle, q≈{queue_time_s*1000:.0f}ms)")
+
+            # Maintain target tick frequency (best-effort).
+            dt = time.monotonic() - now
+            if dt < interval_s:
+                time.sleep(min(0.25, interval_s - dt))
 
     def _rt_tick(self) -> None:
         if not self._rt_active:
@@ -984,8 +1285,13 @@ class RealtimeMixin:
         self.after(interval_ms, self._kb_tick)
 
     def _realtime_handle_job_done(self, job: GCodeJob, lines: list[str], ok: bool) -> None:
-        if job.tag in {"rt_move", "rt_m400"} and self._rt_pending_acks > 0:
-            self._rt_pending_acks -= 1
+        try:
+            with getattr(self, "_rt_loop_lock"):
+                if job.tag in {"rt_move", "rt_m400"} and self._rt_pending_acks > 0:
+                    self._rt_pending_acks -= 1
+        except Exception:
+            if job.tag in {"rt_move", "rt_m400"} and self._rt_pending_acks > 0:
+                self._rt_pending_acks -= 1
         if job.tag in {"kb_move", "kb_m400"} and self._kb_pending_acks > 0:
             self._kb_pending_acks -= 1
 
@@ -1004,8 +1310,13 @@ class RealtimeMixin:
                     x, y, _z, _e = pos
                     if x is None or y is None:
                         continue
-                    self._rt_virtual_x = float(x)
-                    self._rt_virtual_y = float(y)
+                    try:
+                        with getattr(self, "_rt_loop_lock"):
+                            self._rt_virtual_x = float(x)
+                            self._rt_virtual_y = float(y)
+                    except Exception:
+                        self._rt_virtual_x = float(x)
+                        self._rt_virtual_y = float(y)
                     self._rt_target_from_current()
                     self._rt_pending_start = False
                     self._rt_status_var.set("Running")
@@ -1059,6 +1370,7 @@ class RealtimeMixin:
 
         self._rt_active = False
         self._rt_pending_start = False
+        self._rt_loop_stop()
         self._rt_pending_acks = 0
         self._rt_mouse_down = False
         self._rt_mouse_inside = False

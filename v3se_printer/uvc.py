@@ -315,6 +315,8 @@ def compute_sharpness(
     crop_top_pct: float = 0.0,
     crop_right_pct: float = 0.0,
     crop_bottom_pct: float = 0.0,
+    max_width: int | None = 480,
+    method: str = "laplacian_var",
 ) -> float:
     cv2 = _try_import_cv2()
     if cv2 is None:
@@ -329,14 +331,19 @@ def compute_sharpness(
         crop_bottom_pct=crop_bottom_pct,
     )
 
-    # Downscale a bit to reduce CPU and noise sensitivity.
-    try:
-        max_w = 640
-        if img.shape[1] > max_w:
-            scale = max_w / float(img.shape[1])
-            img = cv2.resize(img, dsize=None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    except Exception:
-        pass
+    # Optional downscale (use None for full-res focus metrics).
+    if max_width is not None:
+        try:
+            max_w = int(max_width)
+        except Exception:
+            max_w = 0
+        if max_w > 0:
+            try:
+                if img.shape[1] > max_w:
+                    scale = max_w / float(img.shape[1])
+                    img = cv2.resize(img, dsize=None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            except Exception:
+                pass
 
     if len(img.shape) == 2:
         gray = img
@@ -344,6 +351,14 @@ def compute_sharpness(
         gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
     else:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    m = (method or "laplacian_var").strip().lower()
+    if m == "tenengrad":
+        # Tenengrad (gradient energy) is a popular focus measure.
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        return float((gx * gx + gy * gy).mean())
+
+    # Default: variance of Laplacian.
     lap = cv2.Laplacian(gray, cv2.CV_64F)
-    # Variance of Laplacian is a common sharpness proxy.
     return float(lap.var())

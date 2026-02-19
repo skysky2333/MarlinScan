@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 import base64
+from dataclasses import replace
+import os
 import queue
 import re
 import threading
@@ -20,6 +22,7 @@ from .ui.maint import MaintTabMixin
 from .ui.move import MoveTabMixin
 from .ui.quick import QuickTabMixin
 from .ui.realtime import RealtimeMixin
+from .ui.scan import ScanTabMixin
 from .ui.temps import TempsTabMixin
 from .ui.tuning import TuningTabMixin
 from .uvc import (
@@ -78,6 +81,7 @@ class PrinterGUI(
     MoveTabMixin,
     BedTabMixin,
     RealtimeMixin,
+    ScanTabMixin,
     TempsTabMixin,
     TuningTabMixin,
     MaintTabMixin,
@@ -101,6 +105,16 @@ class PrinterGUI(
         # UVC camera state (optional, requires opencv-python).
         self._cam_lock = threading.Lock()
         self._cam_cap: object | None = None
+        self._cam_connected = False
+        self._cam_connecting = False
+        self._cam_scanning = False
+        self._cam_worker_stop = threading.Event()
+        self._cam_worker_thread: threading.Thread | None = None
+        self._cam_cmd_q: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._cam_preview_q: queue.Queue[tuple[float, str, float | None]] = queue.Queue(maxsize=1)  # (ts, b64png, sharp)
+        self._cam_preview_last_ts: float | None = None
+        self._cam_preview_last_sent_w: int = 960
+        self._cam_connected_index: int | None = None
         self._cam_indices: list[int] = []
         self._cam_index_var = tk.StringVar()
         self._cam_status_var = tk.StringVar(value="Camera: Disconnected")
@@ -113,8 +127,8 @@ class PrinterGUI(
         self._cam_preview_after_id: str | None = None
         self._cam_preview_photo: tk.PhotoImage | None = None
         self._cam_preview_frame_count = 0
-        self._cam_preview_consec_fail = 0
-        self._cam_preview_last_fail_note_ts = 0.0
+        self._cam_preview_consec_fail = 0  # UI-only (worker maintains its own count)
+        self._cam_preview_last_fail_note_ts = 0.0  # UI-only
         self._cam_preview_sharp_var = tk.StringVar(value="Sharpness: ?")
         self._cam_preview_info_var = tk.StringVar(value="")
         self._cam_sharp_hist: deque[tuple[float, float]] = deque(maxlen=240)
@@ -124,6 +138,14 @@ class PrinterGUI(
         self._cam_latest_sharpness: float | None = None
         self._cam_latest_frame_size: tuple[int, int] | None = None  # (w, h) from raw frame
         self._cam_latest_cap_info: str = ""
+        self._cam_latest_readback: dict[str, float] = {}
+        self._cam_sharp_samples: deque[tuple[float, float]] = deque(maxlen=4000)
+        self._cam_latest_frame: object | None = None  # last raw frame (numpy array), best-effort
+        self._cam_worker_fail_count: int = 0
+
+        # Bed scan (camera mosaic) state.
+        self._scan_active = False
+        self._scan_stop = threading.Event()
 
         self._config = PrinterConfig()
         self._poll_pending_m105 = False
@@ -198,6 +220,29 @@ class PrinterGUI(
         self._bed_z_min_var = tk.DoubleVar(value=0.0)
         self._bed_z_max_var = tk.DoubleVar(value=250.0)
 
+        # Scan tab (camera tile scan) UI state.
+        self._scan_status_var = tk.StringVar(value="Scan: Idle")
+        self._scan_estimate_var = tk.StringVar(value="Estimate: —")
+        self._scan_x_min_var = tk.DoubleVar(value=float(self._bed_x_min_var.get()))
+        self._scan_x_max_var = tk.DoubleVar(value=float(self._bed_x_max_var.get()))
+        self._scan_y_min_var = tk.DoubleVar(value=float(self._bed_y_min_var.get()))
+        self._scan_y_max_var = tk.DoubleVar(value=float(self._bed_y_max_var.get()))
+        self._scan_step_x_var = tk.StringVar(value="10")
+        self._scan_step_y_var = tk.StringVar(value="10")
+        self._scan_serpentine_var = tk.BooleanVar(value=True)
+        self._scan_focus_plane_var = tk.BooleanVar(value=False)
+        self._scan_focus_mesh_var = tk.StringVar(value="3x3")
+        self._scan_af_each_tile_var = tk.BooleanVar(value=True)
+        self._scan_shots_var = tk.StringVar(value="1")
+        self._scan_stack_var = tk.StringVar(value="none")
+        self._scan_stitch_method_var = tk.StringVar(value="bed")
+        self._scan_downsample_var = tk.StringVar(value="1")
+        self._scan_build_pyramid_var = tk.BooleanVar(value=True)
+        self._scan_build_deepzoom_var = tk.BooleanVar(value=False)
+        self._scan_pyramid_tile_var = tk.StringVar(value="512")
+        self._scan_tiff_compression_var = tk.StringVar(value="none")
+        self._scan_out_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "scans"))
+
         self._target_x_var = tk.DoubleVar(value=0.0)
         self._target_y_var = tk.DoubleVar(value=0.0)
         self._target_z_var = tk.DoubleVar(value=0.0)
@@ -271,7 +316,15 @@ class PrinterGUI(
         self._set_controls_connected(False)
         self._set_camera_controls_connected(False)
         self.refresh_ports()
-        self.refresh_cameras()
+        # Startup: do not probe cameras (slow and may trigger permission prompts).
+        # Users can type an index manually or click Scan.
+        try:
+            self.cam_combo["values"] = [str(i) for i in range(6)]
+        except Exception:
+            pass
+        if not self._cam_index_var.get().strip():
+            self._cam_index_var.set("0")
+        self._cam_status_var.set("Camera: Disconnected (enter index or click Scan)")
 
         self.after(50, self._drain_events)
         self.after(500, self._poll_tick)
@@ -285,7 +338,7 @@ class PrinterGUI(
         self.cam_combo = ttk.Combobox(cam_top, textvariable=self._cam_index_var, width=10, state="normal")
         self.cam_combo.grid(row=0, column=1, sticky=tk.W, padx=(6, 10))
 
-        self.cam_refresh_btn = ttk.Button(cam_top, text="Refresh", command=self.refresh_cameras)
+        self.cam_refresh_btn = ttk.Button(cam_top, text="Scan", command=self.refresh_cameras)
         self.cam_refresh_btn.grid(row=0, column=2, sticky=tk.W)
 
         self.cam_connect_btn = ttk.Button(cam_top, text="Connect", command=self.toggle_camera_connect)
@@ -395,6 +448,7 @@ class PrinterGUI(
         move_tab = ttk.Frame(self.notebook, padding=10)
         bed_tab = ttk.Frame(self.notebook, padding=10)
         bed_realtime_tab = ttk.Frame(self.notebook, padding=10)
+        scan_tab = ttk.Frame(self.notebook, padding=10)
         temps_tab = ttk.Frame(self.notebook, padding=10)
         tuning_tab = ttk.Frame(self.notebook, padding=10)
         maint_tab = ttk.Frame(self.notebook, padding=10)
@@ -403,6 +457,7 @@ class PrinterGUI(
         self.notebook.add(move_tab, text="Move")
         self.notebook.add(bed_tab, text="Bed")
         self.notebook.add(bed_realtime_tab, text="Bed Realtime")
+        self.notebook.add(scan_tab, text="Scan")
         self.notebook.add(temps_tab, text="Temps/Fan")
         self.notebook.add(tuning_tab, text="Tuning")
         self.notebook.add(maint_tab, text="Level/EEPROM")
@@ -411,6 +466,7 @@ class PrinterGUI(
         self._build_move_tab(move_tab)
         self._build_bed_tab(bed_tab)
         self._build_bed_realtime_tab(bed_realtime_tab)
+        self._build_scan_tab(scan_tab)
         self._build_temps_tab(temps_tab)
         self._build_tuning_tab(tuning_tab)
         self._build_maint_tab(maint_tab)
@@ -475,6 +531,10 @@ class PrinterGUI(
                 return
             if self._rt_active or self._kb_active:
                 # Avoid injecting M105/M114 while realtime motion streaming is active.
+                self.after(int(interval_s * 1000), self._poll_tick)
+                return
+            if self._scan_active:
+                # Avoid injecting M105/M114 while scan motion/capture is active.
                 self.after(int(interval_s * 1000), self._poll_tick)
                 return
             # Status polling: enqueue low-priority queries (one-at-a-time).
@@ -785,46 +845,37 @@ class PrinterGUI(
             self._port_var.set(values[0])
 
     def refresh_cameras(self) -> None:
+        if self._cam_connected or self._cam_connecting:
+            return
+        if self._cam_scanning:
+            return
+
         try:
             import cv2  # type: ignore  # noqa: F401
         except Exception:
             self._cam_indices = []
-            self.cam_combo["values"] = []
+            try:
+                self.cam_combo["values"] = []
+            except Exception:
+                pass
             self._cam_index_var.set("")
-            if self._cam_cap is None:
+            if not self._cam_connected:
                 self._cam_status_var.set("Camera: OpenCV not installed (pip install opencv-python).")
             return
 
-        probes = probe_uvc_indices(max_index=6, read_tries=3)
-        indices = [p.index for p in probes if p.opened]
-        self._cam_indices = indices
-        values: list[str] = []
-        for p in probes:
-            if not p.opened:
-                continue
-            suffix = "" if p.frame_ok else " (no frames)"
-            info = p.info if p.info else "?"
-            values.append(f"{p.index} - {info}{suffix}")
-        self.cam_combo["values"] = values
+        self._cam_scanning = True
+        self._cam_status_var.set("Camera: Scanning… (may trigger macOS camera prompts)")
+        self._set_camera_controls_connected(False)
+        threading.Thread(target=self._camera_scan_worker, daemon=True).start()
 
-        current = self._cam_index_var.get().strip()
-        if current:
-            if current in values:
-                return
-            cur_idx = self._resolve_camera_index()
-            if cur_idx is not None:
-                for v in values:
-                    if v.startswith(f"{cur_idx} -"):
-                        self._cam_index_var.set(v)
-                        return
-        if values:
-            self._cam_index_var.set(values[0])
-            if self._cam_cap is None:
-                self._cam_status_var.set("Camera: Disconnected")
-        else:
-            self._cam_index_var.set("")
-            if self._cam_cap is None:
-                self._cam_status_var.set("Camera: No devices found.")
+    def _camera_scan_worker(self) -> None:
+        # Note: probing by index requires opening devices (can be slow and may trigger prompts).
+        try:
+            probes = probe_uvc_indices(max_index=6, read_tries=1)
+            payload = [(int(p.index), bool(p.opened), bool(p.frame_ok), str(p.info)) for p in probes]
+            self._events.put(("cam-scan-done", payload))
+        except Exception as exc:
+            self._events.put(("cam-scan-failed", str(exc)))
 
     def _resolve_camera_index(self) -> int | None:
         text = self._cam_index_var.get().strip()
@@ -843,14 +894,430 @@ class PrinterGUI(
         except Exception:
             return None
 
+    def _ensure_camera_worker(self) -> None:
+        t = self._cam_worker_thread
+        if t is not None and t.is_alive():
+            return
+        self._cam_worker_stop.clear()
+        self._cam_worker_thread = threading.Thread(target=self._camera_worker_loop, daemon=True)
+        self._cam_worker_thread.start()
+
+    def _camera_cfg_snapshot(self) -> UvcCameraConfig:
+        # `UvcCameraConfig` contains only primitives; `replace` is a cheap safe copy.
+        return replace(self._cam_config)
+
+    def _cam_send_cmd(self, cmd: str, payload: object = None) -> None:
+        self._ensure_camera_worker()
+        try:
+            self._cam_cmd_q.put_nowait((str(cmd), payload))
+        except Exception:
+            pass
+
+    def _camera_worker_loop(self) -> None:
+        cap = None
+        idx: int | None = None
+        preview_enabled = False
+        cfg = self._camera_cfg_snapshot()
+
+        last_ui_push = 0.0
+        last_info = 0.0
+        last_readback = 0.0
+        last_auto_restart = 0.0
+        display_max_w = 960
+        fail_count = 0
+        enc_cond = threading.Condition()
+        enc_job: tuple[float, object, float | None, UvcCameraConfig, int] | None = None
+        enc_stop = threading.Event()
+
+        try:
+            import cv2  # type: ignore
+        except Exception:
+            cv2 = None  # type: ignore[assignment]
+
+        def _close_cap() -> None:
+            nonlocal cap, idx
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            cap = None
+            idx = None
+
+        def _open_cap(open_idx: int) -> tuple[bool, str, bool]:
+            nonlocal cap, idx
+            if cv2 is None:
+                return (False, "OpenCV not installed", False)
+            _close_cap()
+
+            tried_avf = False
+            try:
+                cap = cv2.VideoCapture(int(open_idx))
+                if (not cap.isOpened()) and hasattr(cv2, "CAP_AVFOUNDATION"):
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    cap = cv2.VideoCapture(int(open_idx), cv2.CAP_AVFOUNDATION)
+                    tried_avf = True
+                if not cap.isOpened():
+                    _close_cap()
+                    return (False, "Failed to open camera", False)
+            except Exception as exc:
+                _close_cap()
+                return (False, str(exc), False)
+
+            def _try_read_frames(c) -> bool:
+                try:
+                    for _i in range(3):
+                        ok, frame = c.read()
+                        if ok and frame is not None:
+                            return True
+                        time.sleep(0.05)
+                except Exception:
+                    return False
+                return False
+
+            try:
+                # Reduce latency where supported (backend-specific).
+                if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1.0)
+            except Exception:
+                pass
+
+            # Apply stream + control settings before reading frames.
+            try:
+                apply_uvc_config(cap, cfg)
+            except Exception:
+                pass
+
+            frame_ok = _try_read_frames(cap)
+            if (not frame_ok) and (not tried_avf) and hasattr(cv2, "CAP_AVFOUNDATION"):
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                try:
+                    cap2 = cv2.VideoCapture(int(open_idx), cv2.CAP_AVFOUNDATION)
+                    if cap2.isOpened():
+                        cap = cap2
+                        try:
+                            apply_uvc_config(cap, cfg)
+                        except Exception:
+                            pass
+                        frame_ok = _try_read_frames(cap)
+                except Exception:
+                    pass
+
+            info = "?"
+            try:
+                info = get_capture_info(cap)
+            except Exception:
+                pass
+
+            idx = int(open_idx)
+            return (True, info, bool(frame_ok))
+
+        def _encoder_loop() -> None:
+            nonlocal enc_job
+            while not self._cam_worker_stop.is_set() and (not enc_stop.is_set()):
+                job = None
+                with enc_cond:
+                    if enc_job is None:
+                        enc_cond.wait(timeout=0.25)
+                    job = enc_job
+                    enc_job = None
+                if job is None:
+                    continue
+                if cv2 is None:
+                    continue
+                ts, fr, sharp, cfg_job, disp_w = job
+                try:
+                    disp = transform_frame(
+                        fr,
+                        rotation_deg=cfg_job.rotation_deg,
+                        crop_left_pct=cfg_job.crop_left_pct,
+                        crop_top_pct=cfg_job.crop_top_pct,
+                        crop_right_pct=cfg_job.crop_right_pct,
+                        crop_bottom_pct=cfg_job.crop_bottom_pct,
+                        max_width=int(disp_w),
+                    )
+                except Exception:
+                    disp = fr
+                try:
+                    if len(disp.shape) == 2:  # type: ignore[attr-defined]
+                        rgb = cv2.cvtColor(disp, cv2.COLOR_GRAY2RGB)
+                    elif disp.shape[2] == 4:  # type: ignore[index]
+                        rgb = cv2.cvtColor(disp, cv2.COLOR_BGRA2RGB)
+                    else:
+                        rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+                    ok2, buf = cv2.imencode(".png", rgb)
+                    if ok2:
+                        b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+                        try:
+                            self._cam_preview_q.put_nowait((float(ts), b64, sharp))
+                        except queue.Full:
+                            try:
+                                _ = self._cam_preview_q.get_nowait()
+                            except queue.Empty:
+                                pass
+                            try:
+                                self._cam_preview_q.put_nowait((float(ts), b64, sharp))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        enc_thread = threading.Thread(target=_encoder_loop, daemon=True)
+        enc_thread.start()
+
+        while not self._cam_worker_stop.is_set():
+            # Commands first (best-effort)
+            try:
+                cmd, payload = self._cam_cmd_q.get(timeout=0.01 if (preview_enabled and cap is not None) else 0.25)
+            except queue.Empty:
+                cmd, payload = ("", None)
+
+            if cmd:
+                cmd_s = str(cmd)
+                if cmd_s == "open":
+                    if isinstance(payload, tuple) and len(payload) == 2:
+                        try:
+                            open_idx_p, cfg_p = payload  # type: ignore[misc]
+                        except Exception:
+                            open_idx_p, cfg_p = payload, None
+                        if isinstance(cfg_p, UvcCameraConfig):
+                            cfg = cfg_p
+                        payload = open_idx_p
+                    try:
+                        open_idx = int(payload)  # type: ignore[arg-type]
+                    except Exception:
+                        self._events.put(("cam-open-failed", ("?", "Invalid camera index.")))
+                        continue
+                    ok, info, frame_ok = _open_cap(open_idx)
+                    if ok:
+                        suffix = "" if frame_ok else " (no frames)"
+                        self._events.put(("cam-opened", (open_idx, f"{info}{suffix}")))
+                        fail_count = 0
+                    else:
+                        self._events.put(("cam-open-failed", (open_idx, info)))
+                    continue
+
+                if cmd_s == "close":
+                    _close_cap()
+                    preview_enabled = False
+                    fail_count = 0
+                    with self._cam_frame_cond:
+                        self._cam_latest_frame = None
+                        self._cam_worker_fail_count = 0
+                        self._cam_frame_cond.notify_all()
+                    self._events.put(("cam-closed", None))
+                    continue
+
+                if cmd_s == "set_preview":
+                    preview_enabled = bool(payload)
+                    continue
+
+                if cmd_s == "set_display_w":
+                    try:
+                        display_max_w = max(240, int(payload))  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                    continue
+
+                if cmd_s == "apply_cfg":
+                    try:
+                        if isinstance(payload, UvcCameraConfig):
+                            cfg = payload
+                        else:
+                            cfg = self._camera_cfg_snapshot()
+                    except Exception:
+                        cfg = self._camera_cfg_snapshot()
+                    try:
+                        if cap is not None:
+                            apply_uvc_config(cap, cfg)
+                    except Exception:
+                        pass
+                    continue
+
+                if cmd_s == "restart":
+                    # payload can be an index; reuse current index if None.
+                    open_idx = idx
+                    try:
+                        if isinstance(payload, tuple) and len(payload) == 2:
+                            open_idx_p, cfg_p = payload  # type: ignore[misc]
+                            if isinstance(cfg_p, UvcCameraConfig):
+                                cfg = cfg_p
+                            payload = open_idx_p
+                        if payload is not None:
+                            open_idx = int(payload)  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                    if open_idx is None:
+                        self._events.put(("cam-open-failed", ("?", "Camera not connected.")))
+                        continue
+                    ok, info, frame_ok = _open_cap(int(open_idx))
+                    if ok:
+                        suffix = "" if frame_ok else " (no frames)"
+                        self._events.put(("cam-opened", (int(open_idx), f"{info}{suffix}")))
+                        fail_count = 0
+                    else:
+                        self._events.put(("cam-open-failed", (int(open_idx), info)))
+                    continue
+
+            if not preview_enabled or cap is None:
+                continue
+
+            # Capture a frame (may block, but we're in a worker thread).
+            ok = False
+            frame = None
+            try:
+                ok, frame = cap.read()
+            except Exception:
+                ok, frame = False, None
+
+            now = time.monotonic()
+            if (not ok) or (frame is None):
+                # Quick retry can smooth transient backend hiccups.
+                try:
+                    ok, frame = cap.read()
+                except Exception:
+                    ok, frame = False, None
+                if (not ok) or (frame is None):
+                    fail_count += 1
+                    with self._cam_frame_cond:
+                        self._cam_worker_fail_count = int(fail_count)
+                        self._cam_frame_cond.notify_all()
+                    if fail_count in {1, 10, 30, 60}:
+                        self._events.put(("cam-preview-fail", int(fail_count)))
+                    # Best-effort auto-recover if the backend gets wedged.
+                    if idx is not None and fail_count >= 90 and (now - last_auto_restart) >= 5.0:
+                        last_auto_restart = now
+                        try:
+                            self._events.put(("cam-status", "Camera: Restarting stream (read failures)…"))
+                        except Exception:
+                            pass
+                        try:
+                            ok2, info2, frame_ok2 = _open_cap(int(idx))
+                        except Exception:
+                            ok2, info2, frame_ok2 = False, "restart failed", False
+                        if ok2:
+                            suffix = "" if frame_ok2 else " (no frames)"
+                            try:
+                                self._events.put(("cam-status", f"Camera: Stream restarted ({info2}{suffix})"))
+                            except Exception:
+                                pass
+                            fail_count = 0
+                            with self._cam_frame_cond:
+                                self._cam_worker_fail_count = 0
+                                self._cam_frame_cond.notify_all()
+                    time.sleep(0.01)
+                    continue
+            fail_count = 0
+
+            raw_w = 0
+            raw_h = 0
+            try:
+                raw_h, raw_w = frame.shape[:2]
+            except Exception:
+                pass
+
+            # Compute sharpness on the raw frame (software transforms applied inside the function).
+            sharp: float | None = None
+            try:
+                sharp = compute_sharpness(
+                    frame,
+                    rotation_deg=cfg.rotation_deg,
+                    crop_left_pct=cfg.crop_left_pct,
+                    crop_top_pct=cfg.crop_top_pct,
+                    crop_right_pct=cfg.crop_right_pct,
+                    crop_bottom_pct=cfg.crop_bottom_pct,
+                )
+            except Exception:
+                sharp = None
+
+            cap_info = ""
+            if (now - last_info) >= 0.5:
+                last_info = now
+                try:
+                    cap_info = get_capture_info(cap)
+                except Exception:
+                    cap_info = ""
+
+            rb: dict[str, float] = {}
+            if cv2 is not None and (now - last_readback) >= 1.0:
+                last_readback = now
+
+                def _get(prop: int) -> float | None:
+                    try:
+                        v = float(cap.get(prop))
+                    except Exception:
+                        return None
+                    if v != v:
+                        return None
+                    return v
+
+                for name, prop in (
+                    ("focus", cv2.CAP_PROP_FOCUS),
+                    ("exposure", cv2.CAP_PROP_EXPOSURE),
+                    ("wb_temp", cv2.CAP_PROP_WB_TEMPERATURE),
+                    ("brightness", cv2.CAP_PROP_BRIGHTNESS),
+                    ("contrast", cv2.CAP_PROP_CONTRAST),
+                    ("saturation", cv2.CAP_PROP_SATURATION),
+                    ("hue", cv2.CAP_PROP_HUE),
+                    ("gamma", cv2.CAP_PROP_GAMMA),
+                    ("gain", cv2.CAP_PROP_GAIN),
+                ):
+                    v = _get(prop)
+                    if v is not None:
+                        rb[name] = float(v)
+
+                sh_prop = getattr(cv2, "CAP_PROP_SHARPNESS", None)
+                if sh_prop is not None:
+                    v = _get(int(sh_prop))
+                    if v is not None:
+                        rb["sharpness"] = float(v)
+
+            with self._cam_frame_cond:
+                self._cam_frame_seq += 1
+                self._cam_latest_sharpness = sharp
+                self._cam_latest_frame_size = (raw_w, raw_h) if (raw_w and raw_h) else None
+                self._cam_latest_frame = frame
+                self._cam_worker_fail_count = 0
+                if cap_info:
+                    self._cam_latest_cap_info = cap_info
+                if sharp is not None:
+                    self._cam_sharp_samples.append((now, float(sharp)))
+                if rb:
+                    self._cam_latest_readback = rb
+                self._cam_frame_cond.notify_all()
+
+            # Push a display frame at a lower rate to keep the main thread snappy.
+            ui_interval = 0.1
+            if getattr(self, "_rt_active", False) or getattr(self, "_kb_active", False):
+                ui_interval = 0.2
+            if getattr(self, "_scan_active", False):
+                ui_interval = max(ui_interval, 0.2)
+            if (now - last_ui_push) < float(ui_interval):
+                continue
+            last_ui_push = now
+            # Offload PNG encoding to a separate thread so sharpness sampling stays fast.
+            with enc_cond:
+                enc_job = (float(now), frame, sharp, cfg, int(display_max_w))
+                enc_cond.notify_all()
+        _close_cap()
+        enc_stop.set()
+        with enc_cond:
+            enc_cond.notify_all()
+        self._events.put(("cam-closed", None))
     def toggle_camera_connect(self) -> None:
-        if self._cam_cap is not None:
+        if self._cam_connected or self._cam_connecting:
             self.disconnect_camera()
         else:
             self.connect_camera()
 
     def connect_camera(self) -> None:
-        if self._cam_cap is not None:
+        if self._cam_connected or self._cam_connecting:
             return
 
         idx = self._resolve_camera_index()
@@ -859,7 +1326,7 @@ class PrinterGUI(
             return
 
         try:
-            import cv2  # type: ignore
+            import cv2  # type: ignore  # noqa: F401
         except Exception:
             messagebox.showerror(
                 "Camera",
@@ -867,82 +1334,17 @@ class PrinterGUI(
             )
             return
 
-        self._cam_status_var.set(f"Camera: Connecting (index {idx})...")
-        cap = None
-        tried_avf = False
-        try:
-            cap = cv2.VideoCapture(idx)
-            if (not cap.isOpened()) and hasattr(cv2, "CAP_AVFOUNDATION"):
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-                cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
-                tried_avf = True
-            if not cap.isOpened():
-                raise RuntimeError("not opened")
-        except Exception as exc:
-            try:
-                if cap is not None:
-                    cap.release()
-            except Exception:
-                pass
-            messagebox.showerror("Camera", f"Failed to open camera {idx}.\n\n{exc}")
-            self._cam_status_var.set("Camera: Disconnected")
-            return
-
-        def _try_read_frames(c) -> bool:
-            try:
-                for _i in range(3):
-                    ok, frame = c.read()
-                    if ok and frame is not None:
-                        return True
-                    time.sleep(0.05)
-            except Exception:
-                return False
-            return False
-
-        frame_ok = _try_read_frames(cap)
-        if (not frame_ok) and (not tried_avf) and hasattr(cv2, "CAP_AVFOUNDATION"):
-            # Some cameras "open" under CAP_ANY but never deliver frames; retry via AVFoundation explicitly.
-            try:
-                cap.release()
-            except Exception:
-                pass
-            try:
-                cap2 = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
-                if cap2.isOpened():
-                    cap = cap2
-                    frame_ok = _try_read_frames(cap)
-            except Exception:
-                pass
-
-        with self._cam_lock:
-            self._cam_cap = cap
-            apply_uvc_config(cap, self._cam_config)
-
-        frame_ok = _try_read_frames(cap)
-
-        with self._cam_lock:
-            info = get_capture_info(cap)
-
-        suffix = "" if frame_ok else " (no frames)"
-        self._cam_status_var.set(f"Camera: Connected (index {idx}, {info}){suffix}")
-        self._set_camera_controls_connected(True)
-
-        if not self._cam_preview_active:
-            self.start_camera_preview()
-
-        if idx not in self._cam_setup_seen:
-            self._cam_setup_seen.add(idx)
-            self.after(0, self.open_camera_setup)
+        self._cam_connecting = True
+        self._cam_status_var.set(f"Camera: Connecting (index {idx})…")
+        self._set_camera_controls_connected(False)
+        self._cam_send_cmd("open", (idx, self._camera_cfg_snapshot()))
 
     def restart_camera_stream(self, *, interactive: bool = True) -> bool:
         if self._cam_af_active:
             if interactive:
                 messagebox.showerror("Camera", "Stop Auto Focus before restarting the camera stream.")
             return False
-        if self._cam_cap is None:
+        if not self._cam_connected:
             if interactive:
                 messagebox.showerror("Camera", "Camera not connected.")
             return False
@@ -954,7 +1356,7 @@ class PrinterGUI(
             return False
 
         try:
-            import cv2  # type: ignore
+            import cv2  # type: ignore  # noqa: F401
         except Exception:
             if interactive:
                 messagebox.showerror(
@@ -963,81 +1365,10 @@ class PrinterGUI(
                 )
             return False
 
-        was_preview = bool(self._cam_preview_active)
-        self.stop_camera_preview()
-
-        old_cap = None
-        with self._cam_lock:
-            old_cap = self._cam_cap
-            self._cam_cap = None
-        try:
-            if old_cap is not None:
-                old_cap.release()
-        except Exception:
-            pass
-
-        self._cam_status_var.set(f"Camera: Restarting stream (index {idx})...")
-        cap = None
-        tried_avf = False
-        try:
-            cap = cv2.VideoCapture(idx)
-            if (not cap.isOpened()) and hasattr(cv2, "CAP_AVFOUNDATION"):
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-                cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
-                tried_avf = True
-            if not cap.isOpened():
-                raise RuntimeError("not opened")
-        except Exception as exc:
-            try:
-                if cap is not None:
-                    cap.release()
-            except Exception:
-                pass
-            if interactive:
-                messagebox.showerror("Camera", f"Failed to restart camera {idx}.\n\n{exc}")
-            self._cam_status_var.set("Camera: Disconnected")
-            self._set_camera_controls_connected(False)
-            return False
-
-        def _try_read_frames(c) -> bool:
-            try:
-                for _i in range(3):
-                    ok, frame = c.read()
-                    if ok and frame is not None:
-                        return True
-                    time.sleep(0.05)
-            except Exception:
-                return False
-            return False
-
-        frame_ok = _try_read_frames(cap)
-        if (not frame_ok) and (not tried_avf) and hasattr(cv2, "CAP_AVFOUNDATION"):
-            try:
-                cap.release()
-            except Exception:
-                pass
-            try:
-                cap2 = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
-                if cap2.isOpened():
-                    cap = cap2
-                    frame_ok = _try_read_frames(cap)
-            except Exception:
-                pass
-
-        with self._cam_lock:
-            self._cam_cap = cap
-            apply_uvc_config(cap, self._cam_config)
-            info = get_capture_info(cap)
-
-        suffix = "" if frame_ok else " (no frames)"
-        self._cam_status_var.set(f"Camera: Connected (index {idx}, {info}){suffix}")
-        self._set_camera_controls_connected(True)
-
-        if was_preview:
-            self.start_camera_preview()
+        self._cam_connecting = True
+        self._cam_status_var.set(f"Camera: Restarting stream (index {idx})…")
+        self._set_camera_controls_connected(False)
+        self._cam_send_cmd("restart", (idx, self._camera_cfg_snapshot()))
         return True
 
     def disconnect_camera(self, *, force: bool = False) -> None:
@@ -1045,7 +1376,14 @@ class PrinterGUI(
             messagebox.showerror("Camera", "Stop Auto Focus before disconnecting the camera.")
             return
 
-        self.stop_camera_preview()
+        # Ensure any in-flight AF thread exits promptly (best-effort).
+        try:
+            self._cam_af_stop.set()
+        except Exception:
+            pass
+        self._cam_af_active = False
+
+        self.stop_camera_preview(force=force)
 
         if self._cam_setup_dialog is not None:
             try:
@@ -1053,23 +1391,15 @@ class PrinterGUI(
             except Exception:
                 pass
             self._cam_setup_dialog = None
-
-        cap = None
-        with self._cam_lock:
-            cap = self._cam_cap
-            self._cam_cap = None
-
-        try:
-            if cap is not None:
-                cap.release()
-        except Exception:
-            pass
-
+        self._cam_connected = False
+        self._cam_connecting = False
+        self._cam_connected_index = None
         self._cam_status_var.set("Camera: Disconnected")
         self._set_camera_controls_connected(False)
+        self._cam_send_cmd("close", None)
 
     def open_camera_setup(self) -> None:
-        if self._cam_cap is None:
+        if not self._cam_connected:
             messagebox.showerror("Camera Setup", "Camera not connected.")
             return
         if self._cam_setup_dialog is not None:
@@ -1235,18 +1565,33 @@ class PrinterGUI(
             value="" if self._cam_config.white_balance is None else f"{self._cam_config.white_balance:g}"
         )
 
+        prop_to_key: dict[int, str] = {}
+        if cv2 is not None:
+            prop_to_key = {
+                int(cv2.CAP_PROP_FOCUS): "focus",
+                int(cv2.CAP_PROP_EXPOSURE): "exposure",
+                int(cv2.CAP_PROP_WB_TEMPERATURE): "wb_temp",
+                int(cv2.CAP_PROP_BRIGHTNESS): "brightness",
+                int(cv2.CAP_PROP_CONTRAST): "contrast",
+                int(cv2.CAP_PROP_SATURATION): "saturation",
+                int(cv2.CAP_PROP_HUE): "hue",
+                int(cv2.CAP_PROP_GAMMA): "gamma",
+                int(cv2.CAP_PROP_GAIN): "gain",
+            }
+            sh_prop = getattr(cv2, "CAP_PROP_SHARPNESS", None)
+            if sh_prop is not None:
+                prop_to_key[int(sh_prop)] = "sharpness"
+
         def _cap_get(prop: int) -> float | None:
-            if cv2 is None:
+            key = prop_to_key.get(int(prop))
+            if not key:
+                return None
+            with self._cam_frame_cond:
+                v = self._cam_latest_readback.get(key)
+            if v is None:
                 return None
             try:
-                with self._cam_lock:
-                    cap = self._cam_cap
-                    if cap is None:
-                        return None
-                    v = float(cap.get(prop))
-                if v != v:
-                    return None
-                return v
+                return float(v)
             except Exception:
                 return None
 
@@ -1538,23 +1883,24 @@ class PrinterGUI(
                 if not self.restart_camera_stream(interactive=interactive):
                     return
 
-            with self._cam_lock:
-                cap = self._cam_cap
-                if cap is None:
-                    if interactive:
-                        messagebox.showerror("Camera Setup", "Camera disconnected.")
-                    return
-                if not did_restart:
-                    apply_uvc_config(cap, self._cam_config)
-                info = get_capture_info(cap)
+            if not self._cam_connected:
+                if interactive:
+                    messagebox.showerror("Camera Setup", "Camera disconnected.")
+                return
+
+            if not did_restart:
+                self._cam_send_cmd("apply_cfg", self._camera_cfg_snapshot())
+            with self._cam_frame_cond:
+                info = self._cam_latest_cap_info
 
             idx = self._resolve_camera_index()
             idx_s = "?" if idx is None else str(idx)
             with self._cam_frame_cond:
                 frame_size = self._cam_latest_frame_size
             size_s = f"{frame_size[0]}x{frame_size[1]} (frame) | " if frame_size else ""
-            self._cam_status_var.set(f"Camera: Connected (index {idx_s}, {size_s}{info})")
-            info_var.set(f"Actual: {size_s}{info}")
+            info_s = info if info else "?"
+            self._cam_status_var.set(f"Camera: Connected (index {idx_s}, {size_s}{info_s})")
+            info_var.set(f"Actual: {size_s}{info_s}")
             self._set_camera_controls_connected(True)
             _update_entry_states()
 
@@ -1648,12 +1994,11 @@ class PrinterGUI(
             if self._cam_setup_dialog is not dlg:
                 return
             try:
-                with self._cam_lock:
-                    cap = self._cam_cap
                 with self._cam_frame_cond:
                     frame_size = self._cam_latest_frame_size
+                    cap_info = self._cam_latest_cap_info
                 size_s = f"{frame_size[0]}x{frame_size[1]} (frame) | " if frame_size else ""
-                actual = "disconnected" if cap is None else f"{size_s}{get_capture_info(cap)}"
+                actual = "disconnected" if (not self._cam_connected) else f"{size_s}{cap_info or '?'}"
                 req_fmt = "Auto" if self._cam_config.fourcc is None else str(self._cam_config.fourcc)
                 requested = f"{self._cam_config.width}x{self._cam_config.height} @ {self._cam_config.fps} fps | {req_fmt}"
                 mismatch = ""
@@ -1690,7 +2035,7 @@ class PrinterGUI(
             self.start_camera_preview()
 
     def start_camera_preview(self) -> None:
-        if self._cam_cap is None:
+        if not self._cam_connected:
             messagebox.showerror("Preview", "Camera not connected.")
             return
 
@@ -1698,6 +2043,7 @@ class PrinterGUI(
         self._cam_preview_frame_count = 0
         self._cam_preview_consec_fail = 0
         self._cam_preview_last_fail_note_ts = 0.0
+        self._cam_preview_last_ts = None
         self._cam_preview_sharp_var.set("Sharpness: ?")
         self._cam_sharp_hist.clear()
         self._cam_sharp_plot_last_draw = 0.0
@@ -1707,10 +2053,15 @@ class PrinterGUI(
             pass
 
         try:
-            with self._cam_lock:
-                cap = self._cam_cap
-                if cap is not None:
-                    self._cam_preview_info_var.set(get_capture_info(cap))
+            with self._cam_frame_cond:
+                info = self._cam_latest_cap_info
+                size = self._cam_latest_frame_size
+            if size and info:
+                self._cam_preview_info_var.set(f"Frame: {size[0]}x{size[1]} | {info}")
+            elif info:
+                self._cam_preview_info_var.set(info)
+            else:
+                self._cam_preview_info_var.set("")
         except Exception:
             self._cam_preview_info_var.set("")
 
@@ -1720,10 +2071,33 @@ class PrinterGUI(
         except Exception:
             pass
 
+        try:
+            w = int(self.cam_preview_label.winfo_width())
+        except Exception:
+            w = 0
+        if w < 200:
+            w = 900
+        # Preview scales to the widget size (up to the raw camera frame width).
+        max_w = max(320, w - 12)
+        try:
+            with self._cam_frame_cond:
+                raw_size = self._cam_latest_frame_size
+            if raw_size:
+                max_w = min(int(max_w), int(raw_size[0]))
+        except Exception:
+            pass
+        self._cam_preview_last_sent_w = int(max_w)
+        self._cam_send_cmd("set_display_w", int(max_w))
+        self._cam_send_cmd("set_preview", True)
+
         self._set_camera_controls_connected(True)
         self._camera_preview_tick()
 
-    def stop_camera_preview(self) -> None:
+    def stop_camera_preview(self, *, force: bool = False) -> None:
+        if self._cam_af_active and (not force):
+            messagebox.showerror("Preview", "Stop Auto Focus before stopping the preview.")
+            return
+
         self._cam_preview_active = False
         if self._cam_preview_after_id is not None:
             try:
@@ -1731,6 +2105,8 @@ class PrinterGUI(
             except Exception:
                 pass
             self._cam_preview_after_id = None
+
+        self._cam_send_cmd("set_preview", False)
 
         self._cam_preview_photo = None
         try:
@@ -1748,152 +2124,91 @@ class PrinterGUI(
         except Exception:
             pass
 
-        self._set_camera_controls_connected(self._cam_cap is not None)
+        self._set_camera_controls_connected(self._cam_connected)
 
     def _camera_preview_tick(self) -> None:
         if not self._cam_preview_active:
             return
 
-        with self._cam_lock:
-            cap = self._cam_cap
-            cfg = self._cam_config
-        if cap is None:
-            self.stop_camera_preview()
+        if not self._cam_connected:
+            self.stop_camera_preview(force=True)
             return
 
-        ok = False
-        frame = None
+        pkt: tuple[float, str, float | None] | None = None
         try:
-            ok, frame = cap.read()
-        except Exception:
-            ok, frame = False, None
+            while True:
+                pkt = self._cam_preview_q.get_nowait()
+        except queue.Empty:
+            pass
 
-        # AVFoundation/OpenCV can occasionally drop a read; quick retries reduce visible flicker.
-        if (not ok) or (frame is None):
-            for _i in range(2):
-                try:
-                    ok, frame = cap.read()
-                except Exception:
-                    ok, frame = False, None
-                if ok and (frame is not None):
-                    break
+        if pkt is not None:
+            ts, b64png, sharp = pkt
+            self._cam_preview_last_ts = float(ts)
+            self._cam_preview_frame_count += 1
 
-        if (not ok) or (frame is None):
-            self._cam_preview_consec_fail += 1
-            now = time.monotonic()
-            if (now - float(self._cam_preview_last_fail_note_ts)) >= 0.5:
-                self._cam_preview_last_fail_note_ts = now
+            try:
+                photo = tk.PhotoImage(data=b64png, format="png")
+            except Exception:
+                photo = None
+
+            if photo is not None:
+                self._cam_preview_photo = photo
                 try:
-                    with self._cam_frame_cond:
-                        last_size = self._cam_latest_frame_size
-                        last_info = self._cam_latest_cap_info
-                    size_s = "?" if not last_size else f"{last_size[0]}x{last_size[1]}"
-                    base = last_info if last_info else ""
-                    extra = f"read failed x{self._cam_preview_consec_fail}"
-                    if base:
-                        self._cam_preview_info_var.set(f"Frame: {size_s} | {base} | {extra}")
-                    else:
-                        self._cam_preview_info_var.set(f"Frame: {size_s} | {extra}")
+                    self.cam_preview_label.configure(image=photo, text="")
                 except Exception:
                     pass
 
-            # Keep the last good image displayed to avoid flicker; only blank after prolonged failures.
-            if self._cam_preview_consec_fail >= 30:
-                try:
-                    self.cam_preview_label.configure(text="Preview: frame read failed", image="")
-                except Exception:
-                    pass
-                self._cam_preview_photo = None
-
-            if self._cam_preview_consec_fail <= 3:
-                delay_ms = 20
-            elif self._cam_preview_consec_fail <= 10:
-                delay_ms = 50
-            elif self._cam_preview_consec_fail <= 30:
-                delay_ms = 100
+            if sharp is not None:
+                self._cam_preview_sharp_var.set(f"Sharpness: {float(sharp):.1f}")
+                self._cam_sharp_hist.append((float(ts), float(sharp)))
+                plot_interval = 0.1
+                if self._rt_active or self._kb_active or self._scan_active:
+                    plot_interval = 0.2
+                if (float(ts) - float(self._cam_sharp_plot_last_draw)) >= float(plot_interval):
+                    self._cam_sharp_plot_last_draw = float(ts)
+                    self._camera_draw_sharpness_plot()
             else:
-                delay_ms = 200
-            self._cam_preview_after_id = self.after(delay_ms, self._camera_preview_tick)
-            return
+                self._cam_preview_sharp_var.set("Sharpness: ?")
 
-        if self._cam_preview_consec_fail:
-            self._cam_preview_consec_fail = 0
-
+        # Refresh the info line periodically, and show fail streak if any.
         try:
-            target_w = int(self.cam_preview_label.winfo_width())
-        except Exception:
-            target_w = 0
-        if target_w < 200:
-            target_w = 900
-        max_w = max(320, min(1280, target_w - 12))
-
-        try:
-            disp = transform_frame(
-                frame,
-                rotation_deg=cfg.rotation_deg,
-                crop_left_pct=cfg.crop_left_pct,
-                crop_top_pct=cfg.crop_top_pct,
-                crop_right_pct=cfg.crop_right_pct,
-                crop_bottom_pct=cfg.crop_bottom_pct,
-                max_width=max_w,
-            )
-        except Exception:
-            disp = frame
-
-        photo = self._frame_to_photoimage(disp)
-        if photo is not None:
-            self._cam_preview_photo = photo
-            try:
-                self.cam_preview_label.configure(image=photo, text="")
-            except Exception:
-                pass
-        else:
-            try:
-                self.cam_preview_label.configure(image="", text="Preview: render failed (try installing pillow).")
-            except Exception:
-                pass
-
-        self._cam_preview_frame_count += 1
-        try:
-            sharp = compute_sharpness(disp)
-            self._cam_preview_sharp_var.set(f"Sharpness: {sharp:.1f}")
-        except Exception:
-            sharp = None
-            self._cam_preview_sharp_var.set("Sharpness: ?")
-        if sharp is not None:
-            t_now = time.monotonic()
-            self._cam_sharp_hist.append((t_now, float(sharp)))
-            if (t_now - float(self._cam_sharp_plot_last_draw)) >= 0.1:
-                self._cam_sharp_plot_last_draw = t_now
-                self._camera_draw_sharpness_plot()
-
-        raw_w = 0
-        raw_h = 0
-        try:
-            raw_h, raw_w = frame.shape[:2]
+            with self._cam_frame_cond:
+                size = self._cam_latest_frame_size
+                info = self._cam_latest_cap_info
+                fails = int(self._cam_worker_fail_count)
+            size_s = "" if not size else f"Frame: {size[0]}x{size[1]} | "
+            base = (size_s + info) if info else size_s.rstrip()
+            if fails > 0:
+                extra = f" | read failed x{fails}"
+            else:
+                extra = ""
+            if base or extra:
+                self._cam_preview_info_var.set((base or "Preview") + extra)
         except Exception:
             pass
 
-        cap_info = ""
-        if (self._cam_preview_frame_count % 10) == 0:
+        # Adjust display width if the UI is resized.
+        try:
+            w = int(self.cam_preview_label.winfo_width())
+        except Exception:
+            w = 0
+        if w >= 200:
+            max_w = max(320, w - 12)
             try:
-                cap_info = get_capture_info(cap)
-                if raw_w and raw_h:
-                    self._cam_preview_info_var.set(f"Frame: {raw_w}x{raw_h} | {cap_info}")
-                else:
-                    self._cam_preview_info_var.set(cap_info)
+                with self._cam_frame_cond:
+                    raw_size = self._cam_latest_frame_size
+                if raw_size:
+                    max_w = min(int(max_w), int(raw_size[0]))
             except Exception:
                 pass
+            if abs(int(max_w) - int(self._cam_preview_last_sent_w)) >= 40:
+                self._cam_preview_last_sent_w = int(max_w)
+                self._cam_send_cmd("set_display_w", int(max_w))
 
-        with self._cam_frame_cond:
-            self._cam_frame_seq += 1
-            self._cam_latest_sharpness = sharp
-            self._cam_latest_frame_size = (raw_w, raw_h) if (raw_w and raw_h) else None
-            if cap_info:
-                self._cam_latest_cap_info = cap_info
-            self._cam_frame_cond.notify_all()
-
-        self._cam_preview_after_id = self.after(50, self._camera_preview_tick)
+        interval_ms = 50
+        if self._rt_active or self._kb_active or self._scan_active:
+            interval_ms = 100
+        self._cam_preview_after_id = self.after(int(interval_ms), self._camera_preview_tick)
 
     def _camera_draw_sharpness_plot(self) -> None:
         try:
@@ -2009,7 +2324,11 @@ class PrinterGUI(
             self._cam_status_var.set("Camera: Stopping AF...")
             return
 
-        if self._cam_cap is None:
+        if self._scan_active:
+            messagebox.showerror("Auto Focus", "Stop Scan before running Auto Focus.")
+            return
+
+        if not self._cam_connected:
             messagebox.showerror("Auto Focus", "Camera not connected.")
             return
         if self._worker is None:
@@ -2047,171 +2366,462 @@ class PrinterGUI(
             daemon=True,
         ).start()
 
-    def _camera_autofocus_thread(self, restore_mode: str, z_min: float, z_max: float, speed_z_mm_s: float) -> None:
+    def _camera_autofocus_thread(
+        self,
+        restore_mode: str,
+        z_min: float,
+        z_max: float,
+        speed_z_mm_s: float,
+        *,
+        emit_events: bool = True,
+        profile: str = "full",
+        start_z_hint: float | None = None,
+        tile_dir_hint: int = 0,
+    ) -> tuple[bool, float | None, float | None, str]:
         def status(msg: str) -> None:
-            self._events.put(("cam-status", msg))
+            if emit_events:
+                self._events.put(("cam-status", msg))
 
         def log(msg: str) -> None:
-            self._events.put(("cam-log", msg))
+            if emit_events:
+                self._events.put(("cam-log", msg))
 
         start_z: float | None = None
         current_z: float | None = None
 
         try:
-            ok, lines = self._send_and_wait("M114", timeout_s=5.0, tag_prefix="af_m114", log=False)
-            if not ok:
-                raise RuntimeError("M114 failed (printer did not respond OK).")
-
             z_val: float | None = None
-            for line in lines:
-                if line.lstrip().lower().startswith("count"):
-                    continue
-                pos = parse_m114(line)
-                if pos is None:
-                    continue
-                _x, _y, z, _e = pos
-                if z is not None:
-                    z_val = float(z)
-                    break
+            profile_s = (profile or "full").strip().lower()
+            if profile_s not in {"full", "tile"}:
+                profile_s = "full"
+
+            if start_z_hint is not None:
+                try:
+                    z_val = float(start_z_hint)
+                    z_val = self._clamp(float(z_val), float(z_min), float(z_max))
+                except Exception:
+                    z_val = None
+
             if z_val is None:
-                raise RuntimeError("Could not parse Z from M114.")
+                ok, lines = self._send_and_wait("M114", timeout_s=5.0, tag_prefix="af_m114", log=False)
+                if not ok:
+                    raise RuntimeError("M114 failed (printer did not respond OK).")
 
-            start_z = z_val
-            current_z = z_val
+                for line in lines:
+                    if line.lstrip().lower().startswith("count"):
+                        continue
+                    pos = parse_m114(line)
+                    if pos is None:
+                        continue
+                    _x, _y, z, _e = pos
+                    if z is not None:
+                        z_val = float(z)
+                        break
+                if z_val is None:
+                    raise RuntimeError("Could not parse Z from M114.")
 
-            seq, sharp0 = self._camera_get_latest_sharpness()
+            cfg = self._camera_cfg_snapshot()
+            try:
+                cam_fps = float(cfg.fps)
+            except Exception:
+                cam_fps = 30.0
+            cam_fps = max(1.0, min(240.0, float(cam_fps)))
+            # For UVC pipelines, a tiny delay / frame drop after motion helps avoid measuring
+            # buffered frames captured during movement.
+            min_sample_settle_s = min(0.2, 1.0 / float(cam_fps))
+            drop_after_move_frames = 1
+            start_z = float(z_val)
+            current_z = float(z_val)
+
+            # Ensure we have live camera frames (otherwise AF can appear to do nothing).
+            with self._cam_frame_cond:
+                seq = int(self._cam_frame_seq)
+            seq, fr0 = self._camera_wait_for_next_frame(seq, timeout_s=3.0)
+            if fr0 is None:
+                status("Camera: AF waiting for camera frames…")
+                try:
+                    self._cam_send_cmd("set_preview", True)
+                except Exception:
+                    pass
+                with self._cam_frame_cond:
+                    seq = int(self._cam_frame_seq)
+                seq, fr0 = self._camera_wait_for_next_frame(seq, timeout_s=3.0)
+                if fr0 is None and self._cam_connected_index is not None:
+                    status("Camera: AF restarting camera stream…")
+                    try:
+                        self._cam_send_cmd("restart", (int(self._cam_connected_index), self._camera_cfg_snapshot()))
+                    except Exception:
+                        pass
+                    with self._cam_frame_cond:
+                        seq = int(self._cam_frame_seq)
+                    seq, fr0 = self._camera_wait_for_next_frame(seq, timeout_s=5.0)
+                if fr0 is None:
+                    raise RuntimeError("No camera frames. Start Preview or restart the stream.")
+
+            def _drop_frames(seq_in: int, *, n: int, timeout_s: float) -> int:
+                seq_local = int(seq_in)
+                per_timeout = max(0.08, float(timeout_s) / max(1, int(n)))
+                for _i in range(max(0, int(n))):
+                    if self._cam_af_stop.is_set():
+                        break
+                    seq_local, _fr = self._camera_wait_for_next_frame(seq_local, timeout_s=per_timeout)
+                return int(seq_local)
+
+            min_frame_timeout = max(0.05, min(0.15, 2.0 / float(cam_fps)))
+
+            def _measure_focus(seq_in: int, *, samples: int, timeout_s: float) -> tuple[int, float | None]:
+                vals: list[float] = []
+                seq_local = int(seq_in)
+                per_timeout = max(float(min_frame_timeout), float(timeout_s) / max(1, int(samples)))
+                for _i in range(max(1, int(samples))):
+                    if self._cam_af_stop.is_set():
+                        break
+                    seq_local, frame = self._camera_wait_for_next_frame(seq_local, timeout_s=per_timeout)
+                    if frame is None:
+                        continue
+                    try:
+                        v = compute_sharpness(
+                            frame,
+                            rotation_deg=cfg.rotation_deg,
+                            crop_left_pct=cfg.crop_left_pct,
+                            crop_top_pct=cfg.crop_top_pct,
+                            crop_right_pct=cfg.crop_right_pct,
+                            crop_bottom_pct=cfg.crop_bottom_pct,
+                            max_width=None,  # full-res metric for autofocus
+                            method="tenengrad",
+                        )
+                        vals.append(float(v))
+                    except Exception:
+                        continue
+                if not vals:
+                    return (seq_local, None)
+                vals.sort()
+                return (seq_local, vals[len(vals) // 2])  # median
+
+            start_samples = 2 if profile_s == "tile" else 3
+            start_timeout = 1.2 if profile_s == "tile" else 2.5
+            seq = _drop_frames(seq, n=int(drop_after_move_frames), timeout_s=0.8)
+            seq, sharp0 = _measure_focus(seq, samples=int(start_samples), timeout_s=float(start_timeout))
             if sharp0 is None:
-                seq, sharp0 = self._camera_wait_for_next_sharpness(seq, timeout_s=2.0)
-            if sharp0 is None:
-                raise RuntimeError("No sharpness samples from camera preview.")
+                raise RuntimeError("No focus samples from camera.")
 
-            max_travel = max(0.0, float(self._cam_config.af_max_travel_mm))
-            travel_min = max(z_min, start_z - max_travel)
-            travel_max = min(z_max, start_z + max_travel)
+            max_travel_cfg = max(0.0, float(cfg.af_max_travel_mm))
+            slow_step = max(0.001, float(cfg.af_slow_step_mm))
+            settle_s = max(0.0, float(cfg.af_settle_ms) / 1000.0)
 
-            fast_step = max(0.001, float(self._cam_config.af_fast_step_mm))
-            slow_step = max(0.001, float(self._cam_config.af_slow_step_mm))
-            settle_s = max(0.0, float(self._cam_config.af_settle_ms) / 1000.0)
+            max_travel = float(max_travel_cfg)
+            if profile_s == "tile":
+                # In scans, adjacent tiles are usually close in focus; use a small local range.
+                max_travel = min(float(max_travel_cfg), max(0.8, 6.0 * float(slow_step)))
+
+            travel_min = max(float(z_min), float(start_z) - float(max_travel))
+            travel_max = min(float(z_max), float(start_z) + float(max_travel))
+            if travel_max <= travel_min + 1e-6:
+                raise RuntimeError("AF travel range is empty (check Z bounds / max travel).")
 
             fast_speed = max(0.5, float(speed_z_mm_s))
-            slow_speed = max(0.5, min(fast_speed, fast_speed * 0.2))
+            fine_speed = max(0.5, min(fast_speed, fast_speed * 0.25))
+            micro_speed = max(0.5, min(fine_speed, fine_speed * 0.5))
 
-            best_z = float(current_z)
-            best_sharp = float(sharp0)
-            last_sharp = float(sharp0)
-            seen_improvement = False
-            worse_streak = 0
-            reversed_once = False
+            # Switch to relative moves once; restore in finally.
+            ok_g91, _ = self._send_and_wait("G91", timeout_s=5.0, tag_prefix="af_g91", log=False)
+            if not ok_g91:
+                raise RuntimeError("Failed to set relative mode (G91).")
 
-            direction = +1.0  # start by moving away from the bed for safety, then reverse if needed
-            status(f"Camera: AF start Z={start_z:.3f} sharp={sharp0:.1f}")
-            log(f"[camera] AF start: Z={start_z:.3f}, sharp={sharp0:.1f} | travel=[{travel_min:.3f},{travel_max:.3f}]")
+            status(f"Camera: AF start Z={start_z:.3f} focus={sharp0:.1f}")
+            log(
+                f"[camera] AF start: Z={start_z:.3f}, focus={sharp0:.1f} | travel=[{travel_min:.3f},{travel_max:.3f}]"
+            )
 
-            max_steps = max(3, int((max_travel / fast_step) + 6))
-            for _i in range(max_steps):
-                if self._cam_af_stop.is_set():
-                    raise InterruptedError("stopped")
+            def _enqueue_waiter(cmd: str, *, timeout_s: float, tag_prefix: str) -> tuple[str, threading.Event]:
+                tag = self._next_waiter_tag(tag_prefix)
+                ev = threading.Event()
+                with self._job_waiters_lock:
+                    self._job_waiters[tag] = ev
+                if not self._send(cmd, log=False, tag=tag, timeout_s=float(timeout_s), interactive=False):
+                    with self._job_waiters_lock:
+                        self._job_waiters.pop(tag, None)
+                    raise RuntimeError(f"Failed to enqueue: {cmd}")
+                return (tag, ev)
+
+            def _wait_and_cleanup(tag: str, ev: threading.Event, *, timeout_s: float) -> bool:
+                ok_local = bool(ev.wait(float(timeout_s)))
+                with self._job_waiters_lock:
+                    result = self._job_waiter_results.pop(tag, None)
+                    self._job_waiters.pop(tag, None)
+                if not ok_local or result is None:
+                    return False
+                return bool(result[0])
+
+            def _move_to_z(target_z: float, speed: float, *, settle_override_s: float | None = None) -> None:
+                nonlocal current_z
                 if current_z is None:
                     raise RuntimeError("internal Z tracking error")
+                target_z_c = self._clamp(float(target_z), float(z_min), float(z_max))
+                dz = float(target_z_c) - float(current_z)
+                if abs(dz) <= 1e-6:
+                    return
+                if not self._af_move_z_rel(dz, float(speed)):
+                    raise RuntimeError("Move failed (Z).")
+                current_z = float(target_z_c)
+                settle_local = float(settle_s) if settle_override_s is None else max(0.0, float(settle_override_s))
+                if settle_local > 1e-6:
+                    time.sleep(settle_local)
 
-                next_z = current_z + (direction * fast_step)
-                if next_z < travel_min or next_z > travel_max:
-                    if not reversed_once:
-                        direction *= -1.0
-                        reversed_once = True
-                        worse_streak = 0
-                        status("Camera: AF coarse (hit bound, reversing)...")
-                        continue
-                    break
+            def _sweep(z0: float, z1: float, *, speed: float, sample_hz: float, label: str) -> list[tuple[float, float]]:
+                nonlocal current_z, seq
+                if current_z is None:
+                    raise RuntimeError("internal Z tracking error")
+                z0_c = self._clamp(float(z0), float(z_min), float(z_max))
+                z1_c = self._clamp(float(z1), float(z_min), float(z_max))
+                _move_to_z(float(z0_c), speed=fast_speed)
 
-                dz = next_z - current_z
-                if not self._af_move_z(dz, fast_speed):
-                    raise RuntimeError("Move failed (Z jog).")
-                current_z = next_z
+                dz_total = float(z1_c) - float(z0_c)
+                if abs(dz_total) <= 1e-6:
+                    return []
+                feed = self._mm_s_to_mm_min(max(0.5, float(speed)))
+                ok_g0, _ = self._send_and_wait(
+                    f"G0 Z{dz_total:g} F{feed}",
+                    timeout_s=5.0,
+                    tag_prefix=f"af_{label}_g0",
+                    log=False,
+                )
+                if not ok_g0:
+                    raise RuntimeError(f"Move failed ({label} sweep).")
+
+                est_dur = abs(dz_total) / max(1e-6, float(speed))
+                m400_timeout = max(30.0, (est_dur * 3.0) + 10.0)
+                tag_m400, ev_m400 = _enqueue_waiter("M400", timeout_s=m400_timeout, tag_prefix=f"af_{label}_m400")
+
+                samples: list[tuple[float, float]] = []
+                t0 = time.monotonic()
+                interval = 1.0 / max(1.0, float(sample_hz))
+                next_sample = t0
+                try:
+                    status(f"Camera: AF {label} sweep {dz_total:+.2f}mm @ {speed:.1f}mm/s…")
+                    while not ev_m400.is_set():
+                        if self._cam_af_stop.is_set():
+                            break
+                        now = time.monotonic()
+                        if now < next_sample:
+                            time.sleep(min(0.01, next_sample - now))
+                            continue
+                        next_sample = now + interval
+
+                        seq, sharp = _measure_focus(seq, samples=1, timeout_s=interval)
+                        if sharp is None:
+                            continue
+                        t1 = time.monotonic()
+                        frac = (t1 - t0) / max(0.2, est_dur)
+                        frac = max(0.0, min(1.0, float(frac)))
+                        z_est = float(z0_c) + (frac * float(dz_total))
+                        samples.append((z_est, float(sharp)))
+                finally:
+                    ok_m400 = _wait_and_cleanup(tag_m400, ev_m400, timeout_s=m400_timeout)
+                    if not ok_m400:
+                        raise RuntimeError(f"M400 failed/timeout ({label}).")
+
+                current_z = float(z1_c)
                 if settle_s:
                     time.sleep(settle_s)
-
-                seq, sharp = self._camera_wait_for_next_sharpness(seq, timeout_s=max(2.0, settle_s + 1.0))
-                if sharp is None:
-                    raise RuntimeError("No sharpness samples from camera preview.")
-
-                if sharp > best_sharp:
-                    best_sharp = sharp
-                    best_z = float(current_z)
-                    seen_improvement = True
-                    worse_streak = 0
-                else:
-                    if sharp < last_sharp:
-                        worse_streak += 1
-                    else:
-                        worse_streak = 0
-
-                last_sharp = sharp
-                status(f"Camera: AF coarse Z={current_z:.3f} sharp={sharp:.1f}")
-
-                if (not seen_improvement) and (not reversed_once) and worse_streak >= 2:
-                    direction *= -1.0
-                    reversed_once = True
-                    worse_streak = 0
-                    status("Camera: AF coarse (reversing)...")
-                    continue
-
-                if seen_improvement and worse_streak >= 2:
-                    break
-
-            if self._cam_af_stop.is_set():
-                raise InterruptedError("stopped")
-            if current_z is None:
-                raise RuntimeError("internal Z tracking error")
-
-            # Stage 2: reverse direction, move slower in small steps around the peak.
-            status(f"Camera: AF fine scan (best Z={best_z:.3f} sharp={best_sharp:.1f})")
-            scan_dir = -direction
-            scan_dist = 2.0 * fast_step
-            scan_steps = max(1, int(abs(scan_dist) / slow_step))
-
-            for _i in range(scan_steps):
                 if self._cam_af_stop.is_set():
                     raise InterruptedError("stopped")
-                next_z = current_z + (scan_dir * slow_step)
-                if next_z < travel_min or next_z > travel_max:
+                return samples
+
+            def _best_of(samples: list[tuple[float, float]]) -> tuple[float, float]:
+                if not samples:
+                    raise RuntimeError("No focus samples captured.")
+                z_b, s_b = max(samples, key=lambda t: float(t[1]))
+                return (float(z_b), float(s_b))
+
+            # Stage 4: ultra refinement (fast discrete sampling).
+            #
+            # The sweeps estimate Z by time; this final stage samples a few exact Z positions and
+            # optionally performs a tiny quadratic interpolation around the peak.
+            def _refine_discrete(z_center: float, s_center: float) -> tuple[float, float]:
+                nonlocal seq
+
+                best_z2 = float(z_center)
+                best_s2 = float(s_center)
+
+                ultra_speed = max(0.5, float(micro_speed))
+
+                # UVC pipelines can lag; enforce a small minimum settle and drop a frame after moves.
+                refine_settle_cap = 0.03 if profile_s == "tile" else 0.06
+                refine_settle = max(float(min_sample_settle_s), min(float(settle_s), float(refine_settle_cap)))
+                drop_n = int(drop_after_move_frames)
+
+                timeout_quick = 0.6 if profile_s == "tile" else 0.7
+                samples_center = 2
+                samples_quick = 1
+                samples_confirm = 2 if profile_s == "tile" else 3
+
+                if profile_s == "tile":
+                    step = max(0.003, float(slow_step) / 6.0)
+                    min_step = 0.001
+                    rounds = 4
+                else:
+                    step = max(0.005, float(slow_step) / 4.0)
+                    min_step = 0.002
+                    rounds = 3
+
+                cache: dict[tuple[float, int], float] = {}
+
+                def _sample(z: float, *, samples: int, timeout_s: float) -> float | None:
+                    nonlocal seq
+                    zc = self._clamp(float(z), float(z_min), float(z_max))
+                    zr = float(round(zc, 6))
+                    key = (zr, int(samples))
+                    if key in cache:
+                        return float(cache[key])
+                    if self._cam_af_stop.is_set():
+                        raise InterruptedError("stopped")
+                    _move_to_z(float(zc), speed=ultra_speed, settle_override_s=refine_settle)
+                    seq = _drop_frames(seq, n=drop_n, timeout_s=max(0.25, float(timeout_s)))
+                    seq, s = _measure_focus(seq, samples=int(samples), timeout_s=float(timeout_s))
+                    if s is None:
+                        return None
+                    cache[key] = float(s)
+                    return float(s)
+
+                # Ensure we have an exact sample at the nominal center Z.
+                s0 = _sample(best_z2, samples=samples_center, timeout_s=max(0.9, float(timeout_quick)))
+                if s0 is not None:
+                    best_s2 = float(s0)
+
+                for _i in range(int(rounds)):
+                    if float(step) < float(min_step):
+                        break
+
+                    z_m = self._clamp(float(best_z2) - float(step), float(z_min), float(z_max))
+                    z_p = self._clamp(float(best_z2) + float(step), float(z_min), float(z_max))
+                    if abs(float(z_p) - float(z_m)) <= 1e-9:
+                        break
+
+                    s_m = _sample(z_m, samples=samples_quick, timeout_s=float(timeout_quick))
+                    s_p = _sample(z_p, samples=samples_quick, timeout_s=float(timeout_quick))
+
+                    # Pick best of center / left / right.
+                    cand: list[tuple[float, float]] = [(float(best_s2), float(best_z2))]
+                    if s_m is not None:
+                        cand.append((float(s_m), float(z_m)))
+                    if s_p is not None:
+                        cand.append((float(s_p), float(z_p)))
+                    s_b, z_b = max(cand, key=lambda t: float(t[0]))
+
+                    if abs(float(z_b) - float(best_z2)) <= 1e-9:
+                        # Peak appears to be inside the bracket; try a tiny quadratic interpolation.
+                        if s_m is not None and s_p is not None:
+                            denom = float(s_m) - (2.0 * float(best_s2)) + float(s_p)
+                            if abs(denom) > 1e-9:
+                                xv = float(best_z2) + (float(step) * (float(s_m) - float(s_p))) / (2.0 * denom)
+                                if float(z_min) <= float(xv) <= float(z_max):
+                                    s_v = _sample(xv, samples=samples_center, timeout_s=max(0.9, float(timeout_quick)))
+                                    if s_v is not None and float(s_v) > float(best_s2):
+                                        best_s2 = float(s_v)
+                                        best_z2 = float(round(float(xv), 6))
+                        step = float(step) * 0.5
+                        continue
+
+                    # Climb toward the better side and keep the same step.
+                    best_z2 = float(z_b)
+                    best_s2 = float(s_b)
+
+                # Final confirmation at chosen Z (more samples to reduce noise).
+                s_f = _sample(best_z2, samples=samples_confirm, timeout_s=1.2)
+                if s_f is not None:
+                    best_s2 = float(s_f)
+                return (float(best_z2), float(best_s2))
+
+            # "Tile" profile: adjacent scan tiles should be close in focus.
+            # Single short sweep + pick best Z (fast, robust enough for scanning tiles).
+            if profile_s == "tile":
+                span = max(1e-6, float(travel_max) - float(travel_min))
+                sample_hz = min(24.0, max(6.0, float(cam_fps) * 0.8))
+                target_samples = 12.0
+                dur = max(0.25, min(0.9, float(target_samples) / max(1.0, float(sample_hz))))
+                speed = max(0.5, min(float(fast_speed), float(span) / max(0.1, float(dur))))
+                status(f"Camera: AF tile sweep {span:.3f}mm @ {speed:.2f}mm/s…")
+                samples = _sweep(float(travel_min), float(travel_max), speed=float(speed), sample_hz=float(sample_hz), label="tile")
+                z_b, s_b = _best_of(samples)
+                status(f"Camera: AF tile best Z≈{z_b:.3f} focus={s_b:.1f}")
+                _move_to_z(float(z_b), speed=max(0.5, float(fine_speed)))
+
+                status(f"Camera: AF done Z≈{z_b:.3f} focus={s_b:.1f}")
+                log(f"[camera] AF tile done: Z≈{z_b:.3f}, focus={s_b:.1f}")
+                msg = f"AF done: Z≈{z_b:.3f} focus={s_b:.1f}"
+                if emit_events:
+                    self._events.put(("cam-af-finished", (True, msg)))
+                return (True, float(z_b), float(s_b), msg)
+
+            best_z = float(start_z)
+            best_sharp = float(sharp0)
+
+            # Stage 1: coarse range search (full).
+            for attempt in range(2):
+                samples = _sweep(travel_min, travel_max, speed=fast_speed, sample_hz=12.0, label="coarse")
+                z_b, s_b = _best_of(samples)
+                status(f"Camera: AF coarse best Z≈{z_b:.3f} focus={s_b:.1f}")
+                if s_b > best_sharp:
+                    best_z, best_sharp = float(z_b), float(s_b)
+                improve = (s_b - float(sharp0)) / max(1.0, float(sharp0))
+                if improve >= 0.05 or attempt == 1:
                     break
+                # Expand the search range once (within hard Z bounds).
+                extra = float(max_travel)
+                max_travel = min(float(z_max - z_min), float(max_travel) + float(extra))
+                travel_min = max(float(z_min), float(start_z) - float(max_travel))
+                travel_max = min(float(z_max), float(start_z) + float(max_travel))
+                status("Camera: AF expanding search range…")
 
-                dz = next_z - current_z
-                if not self._af_move_z(dz, slow_speed):
-                    raise RuntimeError("Move failed (fine Z jog).")
-                current_z = next_z
-                if settle_s:
-                    time.sleep(settle_s)
+            # Stage 2: fine sweep around current best.
+            if profile_s == "tile":
+                fine_span = max(3.0 * slow_step, 0.4)
+            else:
+                fine_span = max(6.0 * slow_step, 2.0)
+            z0 = max(float(z_min), float(best_z) - float(fine_span))
+            z1 = min(float(z_max), float(best_z) + float(fine_span))
+            samples = _sweep(z0, z1, speed=fine_speed, sample_hz=18.0, label="fine")
+            best_z, best_sharp = _best_of(samples)
+            status(f"Camera: AF fine best Z≈{best_z:.3f} focus={best_sharp:.1f}")
 
-                seq, sharp = self._camera_wait_for_next_sharpness(seq, timeout_s=max(2.0, settle_s + 1.0))
-                if sharp is None:
-                    raise RuntimeError("No sharpness samples from camera preview.")
-                if sharp > best_sharp:
-                    best_sharp = sharp
-                    best_z = float(current_z)
-                status(f"Camera: AF fine Z={current_z:.3f} sharp={sharp:.1f}")
+            # Stage 3: micro sweep around fine best.
+            if profile_s == "tile":
+                micro_span = max(1.5 * slow_step, 0.25)
+            else:
+                micro_span = max(3.0 * slow_step, 0.8)
+            z0 = max(float(z_min), float(best_z) - float(micro_span))
+            z1 = min(float(z_max), float(best_z) + float(micro_span))
+            samples = _sweep(z0, z1, speed=micro_speed, sample_hz=22.0, label="micro")
+            best_z, best_sharp = _best_of(samples)
 
-            if self._cam_af_stop.is_set():
-                raise InterruptedError("stopped")
+            best_z, best_sharp = _refine_discrete(float(best_z), float(best_sharp))
+            status(f"Camera: AF refined Z≈{best_z:.3f} focus={best_sharp:.1f}")
 
-            dz_to_best = best_z - float(current_z)
-            if abs(dz_to_best) > 1e-6:
-                status(f"Camera: AF final move to Z={best_z:.3f}...")
-                self._af_move_z(dz_to_best, slow_speed)
-                current_z = best_z
+            # Final: move to refined best estimate.
+            status(f"Camera: AF final move to Z≈{best_z:.3f}…")
+            _move_to_z(float(best_z), speed=micro_speed)
 
-            status(f"Camera: AF done Z={best_z:.3f} sharp={best_sharp:.1f}")
-            log(f"[camera] AF done: Z={best_z:.3f}, sharp={best_sharp:.1f}")
-            self._events.put(("cam-af-finished", (True, f"AF done: Z={best_z:.3f} sharp={best_sharp:.1f}")))
+            status(f"Camera: AF done Z≈{best_z:.3f} focus={best_sharp:.1f}")
+            log(f"[camera] AF done: Z≈{best_z:.3f}, focus={best_sharp:.1f}")
+            msg = f"AF done: Z≈{best_z:.3f} focus={best_sharp:.1f}"
+            if emit_events:
+                self._events.put(("cam-af-finished", (True, msg)))
+            return (True, float(best_z), float(best_sharp), msg)
         except InterruptedError:
             status("Camera: AF stopped.")
             log("[camera] AF stopped.")
-            self._events.put(("cam-af-finished", (False, "AF stopped.")))
+            msg = "AF stopped."
+            if emit_events:
+                self._events.put(("cam-af-finished", (False, msg)))
+            return (False, None, None, msg)
         except Exception as exc:
             status("Camera: AF failed.")
             log(f"[camera] AF failed: {exc}")
-            self._events.put(("cam-af-finished", (False, f"AF failed: {exc}")))
+            msg = f"AF failed: {exc}"
+            if emit_events:
+                self._events.put(("cam-af-finished", (False, msg)))
+            return (False, None, None, msg)
         finally:
             # Restore coordinate mode (best-effort).
             try:
@@ -2223,11 +2833,12 @@ class PrinterGUI(
                 pass
             try:
                 # Refresh position after autofocus.
-                if self._worker is not None:
+                if emit_events and self._worker is not None:
                     self._send("M114", log=False, priority="low", tag="poll_m114", timeout_s=3.0, interactive=False)
                     self._poll_pending_m114 = True
             except Exception:
                 pass
+        return (False, None, None, "AF finished.")
 
     def _af_move_z(self, dz_mm: float, speed_mm_s: float) -> bool:
         if self._worker is None:
@@ -2235,6 +2846,16 @@ class PrinterGUI(
         feed = self._mm_s_to_mm_min(max(0.5, float(speed_mm_s)))
         if not self._send("G91", log=False, interactive=False):
             return False
+        if not self._send(f"G0 Z{dz_mm:g} F{feed}", log=False, timeout_s=10.0, interactive=False):
+            return False
+        ok, _lines = self._send_and_wait("M400", timeout_s=120.0, tag_prefix="af_m400", log=False)
+        return bool(ok)
+
+    def _af_move_z_rel(self, dz_mm: float, speed_mm_s: float) -> bool:
+        """Relative Z move + wait for motion complete (assumes G91 already set)."""
+        if self._worker is None:
+            return False
+        feed = self._mm_s_to_mm_min(max(0.5, float(speed_mm_s)))
         if not self._send(f"G0 Z{dz_mm:g} F{feed}", log=False, timeout_s=10.0, interactive=False):
             return False
         ok, _lines = self._send_and_wait("M400", timeout_s=120.0, tag_prefix="af_m400", log=False)
@@ -2254,6 +2875,16 @@ class PrinterGUI(
                 self._cam_frame_cond.wait(timeout=remaining)
             return self._cam_frame_seq, self._cam_latest_sharpness
 
+    def _camera_wait_for_next_frame(self, last_seq: int, *, timeout_s: float) -> tuple[int, object | None]:
+        deadline = time.monotonic() + max(0.01, float(timeout_s))
+        with self._cam_frame_cond:
+            while self._cam_frame_seq <= last_seq and (not self._cam_af_stop.is_set()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cam_frame_cond.wait(timeout=remaining)
+            return self._cam_frame_seq, self._cam_latest_frame
+
     def _set_controls_connected(self, connected: bool) -> None:
         self.port_combo.configure(state="disabled" if connected else "readonly")
         self.baud_combo.configure(state="disabled" if connected else "normal")
@@ -2266,14 +2897,44 @@ class PrinterGUI(
         self.command_entry.configure(state="normal" if connected else "disabled")
 
     def _set_camera_controls_connected(self, connected: bool) -> None:
+        if self._cam_scanning:
+            self.cam_combo.configure(state="disabled")
+            self.cam_refresh_btn.configure(state="disabled", text="Scanning…")
+            self.cam_connect_btn.configure(state="disabled", text="Connect")
+            self.cam_setup_btn.configure(state="disabled")
+            self.cam_preview_btn.configure(state="disabled", text="Preview")
+            self.cam_af_btn.configure(state="disabled", text="Auto Focus (Z)")
+            try:
+                self.cam_preview_stop_btn.configure(state="disabled")
+            except Exception:
+                pass
+            return
+
+        if self._cam_connecting:
+            self.cam_combo.configure(state="disabled")
+            self.cam_refresh_btn.configure(state="disabled")
+            self.cam_connect_btn.configure(state="disabled", text="Connecting…")
+            self.cam_setup_btn.configure(state="disabled")
+            self.cam_preview_btn.configure(state="disabled", text="Preview")
+            self.cam_af_btn.configure(state="disabled", text="Auto Focus (Z)")
+            try:
+                self.cam_preview_stop_btn.configure(state="disabled")
+            except Exception:
+                pass
+            return
+
         self.cam_combo.configure(state="disabled" if connected else "normal")
-        self.cam_refresh_btn.configure(state="disabled" if connected else "normal")
+        self.cam_refresh_btn.configure(state="disabled" if connected else "normal", text="Scan")
 
         if self._cam_af_active:
             self.cam_connect_btn.configure(state="disabled", text="Disconnect" if connected else "Connect")
             self.cam_setup_btn.configure(state="disabled")
             self.cam_preview_btn.configure(state="disabled", text="Preview")
             self.cam_af_btn.configure(state="normal", text="Stop AF")
+            try:
+                self.cam_preview_stop_btn.configure(state="disabled")
+            except Exception:
+                pass
             return
 
         self.cam_connect_btn.configure(state="normal", text="Disconnect" if connected else "Connect")
@@ -2281,8 +2942,16 @@ class PrinterGUI(
 
         if self._cam_preview_active:
             self.cam_preview_btn.configure(state="normal", text="Stop Preview")
+            try:
+                self.cam_preview_stop_btn.configure(state="normal")
+            except Exception:
+                pass
         else:
             self.cam_preview_btn.configure(state="normal" if connected else "disabled", text="Preview")
+            try:
+                self.cam_preview_stop_btn.configure(state="normal" if connected else "disabled")
+            except Exception:
+                pass
 
         # Autofocus requires both camera + printer (it moves printer Z).
         can_af = connected and (self._worker is not None)
@@ -2351,7 +3020,7 @@ class PrinterGUI(
 
         self._status_var.set(f"Connected: {port} @ {baud} (EOL={self._eol_var.get()})")
         self._set_controls_connected(True)
-        self._set_camera_controls_connected(self._cam_cap is not None)
+        self._set_camera_controls_connected(self._cam_connected)
         self._poll_pending_m105 = False
         self._poll_pending_m114 = False
         self._home_prompt_pending = True
@@ -2398,7 +3067,7 @@ class PrinterGUI(
         self._pos_var.set("X:?  Y:?  Z:?  E:?")
         self._temp_var.set("Hotend:?/?°C  Bed:?/?°C")
         self._set_controls_connected(False)
-        self._set_camera_controls_connected(self._cam_cap is not None)
+        self._set_camera_controls_connected(self._cam_connected)
         self._poll_pending_m105 = False
         self._poll_pending_m114 = False
         self._home_prompt_pending = False
@@ -2477,6 +3146,112 @@ class PrinterGUI(
                     self._cam_status_var.set(str(payload))
                 elif kind == "cam-log":
                     self._append_log(str(payload))
+                elif kind == "cam-opened":
+                    cam_idx = "?"
+                    info = "?"
+                    if isinstance(payload, tuple) and len(payload) == 2:
+                        cam_idx, info = payload  # type: ignore[misc]
+                    # Fresh session state.
+                    self._cam_af_active = False
+                    try:
+                        self._cam_af_stop.clear()
+                    except Exception:
+                        pass
+                    self._cam_connected = True
+                    self._cam_connecting = False
+                    self._cam_connected_index = None
+                    try:
+                        self._cam_connected_index = int(cam_idx)
+                    except Exception:
+                        self._cam_connected_index = None
+                    self._cam_status_var.set(f"Camera: Connected (index {cam_idx}, {info})")
+                    self._set_camera_controls_connected(True)
+
+                    if not self._cam_preview_active:
+                        self.start_camera_preview()
+
+                    try:
+                        idx_i = int(cam_idx)
+                    except Exception:
+                        idx_i = None
+                    if idx_i is not None and idx_i not in self._cam_setup_seen:
+                        self._cam_setup_seen.add(idx_i)
+                        self.after(0, self.open_camera_setup)
+                elif kind == "cam-open-failed":
+                    cam_idx = "?"
+                    msg = ""
+                    if isinstance(payload, tuple) and len(payload) == 2:
+                        cam_idx, msg = payload  # type: ignore[misc]
+                    self._cam_connected = False
+                    self._cam_connecting = False
+                    self._cam_connected_index = None
+                    self._cam_status_var.set("Camera: Disconnected")
+                    self._set_camera_controls_connected(False)
+                    messagebox.showerror("Camera", f"Failed to open camera {cam_idx}.\n\n{msg}")
+                elif kind == "cam-closed":
+                    self._cam_af_active = False
+                    try:
+                        self._cam_af_stop.set()
+                    except Exception:
+                        pass
+                    self._cam_connected = False
+                    self._cam_connecting = False
+                    self._cam_connected_index = None
+                    if self._cam_preview_active:
+                        self.stop_camera_preview(force=True)
+                    self._cam_status_var.set("Camera: Disconnected")
+                    self._set_camera_controls_connected(False)
+                elif kind == "cam-preview-fail":
+                    # UI tick reads the fail count; this event is just informational.
+                    pass
+                elif kind == "cam-scan-done":
+                    self._cam_scanning = False
+                    items: list[tuple[int, bool, bool, str]] = []
+                    if isinstance(payload, list):
+                        try:
+                            items = [(int(a), bool(b), bool(c), str(d)) for (a, b, c, d) in payload]  # type: ignore[misc]
+                        except Exception:
+                            items = []
+
+                    values: list[str] = []
+                    indices: list[int] = []
+                    for idx, opened, frame_ok, info in items:
+                        if not opened:
+                            continue
+                        indices.append(int(idx))
+                        suffix = "" if frame_ok else " (no frames)"
+                        values.append(f"{idx} - {info or '?'}{suffix}")
+                    self._cam_indices = indices
+                    try:
+                        self.cam_combo["values"] = values
+                    except Exception:
+                        pass
+
+                    # Keep selection if possible; otherwise pick the first found.
+                    current = self._cam_index_var.get().strip()
+                    if current and current in values:
+                        pass
+                    else:
+                        cur_idx = self._resolve_camera_index()
+                        set_done = False
+                        if cur_idx is not None:
+                            for v in values:
+                                if v.startswith(f"{cur_idx} -"):
+                                    self._cam_index_var.set(v)
+                                    set_done = True
+                                    break
+                        if (not set_done) and values:
+                            self._cam_index_var.set(values[0])
+
+                    if not values:
+                        self._cam_status_var.set("Camera: No devices found (type index or connect a UVC camera).")
+                    else:
+                        self._cam_status_var.set("Camera: Disconnected")
+                    self._set_camera_controls_connected(self._cam_connected)
+                elif kind == "cam-scan-failed":
+                    self._cam_scanning = False
+                    self._cam_status_var.set("Camera: Scan failed.")
+                    self._set_camera_controls_connected(self._cam_connected)
                 elif kind == "cam-af-finished":
                     ok_flag = False
                     msg = ""
@@ -2486,11 +3261,40 @@ class PrinterGUI(
                         msg = str(payload)
                     self._cam_af_active = False
                     self._cam_af_stop.clear()
-                    self._set_camera_controls_connected(self._cam_cap is not None)
+                    self._set_camera_controls_connected(self._cam_connected)
                     if msg:
                         self._cam_status_var.set(f"Camera: {msg}" if not msg.startswith("Camera:") else msg)
                     if (not bool(ok_flag)) and msg.lower().startswith("af failed"):
                         messagebox.showerror("Auto Focus", msg)
+                elif kind == "rt-status":
+                    try:
+                        self._rt_status_var.set(str(payload))
+                    except Exception:
+                        pass
+                elif kind == "rt-redraw":
+                    try:
+                        self._rt_request_redraw()
+                    except Exception:
+                        pass
+                elif kind == "scan-status":
+                    self._scan_status_var.set(str(payload))
+                elif kind == "scan-finished":
+                    ok_flag = False
+                    msg = ""
+                    if isinstance(payload, tuple) and len(payload) == 2:
+                        ok_flag, msg = payload  # type: ignore[misc]
+                    else:
+                        msg = str(payload)
+                    self._scan_active = False
+                    self._scan_stop.clear()
+                    try:
+                        self._scan_set_ui_running(False)
+                    except Exception:
+                        pass
+                    if msg:
+                        self._scan_status_var.set(str(msg))
+                    if (not bool(ok_flag)) and msg and (not msg.lower().startswith("scan stopped")):
+                        messagebox.showerror("Scan", msg)
         except queue.Empty:
             pass
         self.after(50, self._drain_events)
@@ -2585,10 +3389,18 @@ class PrinterGUI(
 
     def _on_close(self) -> None:
         try:
+            try:
+                self._scan_stop.set()
+            except Exception:
+                pass
             self._cam_af_stop.set()
             self.disconnect_camera(force=True)
             self.disconnect()
         finally:
+            try:
+                self._cam_worker_stop.set()
+            except Exception:
+                pass
             self.destroy()
 
 
