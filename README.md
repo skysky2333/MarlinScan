@@ -7,6 +7,8 @@ Small Tkinter app for sending G-code over serial to a Marlin-based printer (test
 - Python 3.10+ recommended
 - Install dependency:
   - `python -m pip install pyserial`
+  - Optional (UVC camera support): `python -m pip install opencv-python`
+  - Optional (preview rendering fallback): `python -m pip install pillow`
 
 ## Run
 
