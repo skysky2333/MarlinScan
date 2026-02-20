@@ -41,6 +41,7 @@ class ScanParams:
     shots_per_tile: int
     stack_mode: str  # "none" | "best" | "nlmeans"
     stitch_method: str  # "bed" | "opencv"
+    capture_settle_ms: int  # 0 = auto (derived from fps / camera settle)
     downsample: int  # reserved; currently always 1 (full-res)
     build_pyramidal_tiff: bool
     build_deepzoom: bool
@@ -124,6 +125,14 @@ class ScanTabMixin:
             state="readonly",
         ).grid(row=3, column=3, sticky=tk.W, padx=(6, 0), pady=(8, 0))
 
+        ttk.Label(cap, text="Capture settle (ms):").grid(row=4, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Entry(cap, textvariable=self._scan_capture_settle_ms_var, width=8).grid(
+            row=4, column=1, sticky=tk.W, padx=(6, 12), pady=(8, 0)
+        )
+        ttk.Label(cap, text="(0=auto; wait after motion before capture)").grid(
+            row=4, column=2, columnspan=2, sticky=tk.W, pady=(8, 0)
+        )
+
         stitch = ttk.LabelFrame(parent, text="Stitching / Output", padding=10)
         stitch.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
 
@@ -204,6 +213,7 @@ class ScanTabMixin:
                 stack_mode = str(self._scan_stack_var.get()).strip().lower() or "none"
                 pyramid_tile_px = int(float(self._scan_pyramid_tile_var.get()))
                 mesh_txt = str(self._scan_focus_mesh_var.get()).strip().lower().replace("×", "x")
+                capture_settle_ms = int(float(self._scan_capture_settle_ms_var.get()))
                 out_base = (self._scan_out_dir_var.get().strip() or "").strip() or os.path.join(os.getcwd(), "scans")
             except Exception:
                 self._scan_estimate_var.set("Estimate: —")
@@ -222,6 +232,7 @@ class ScanTabMixin:
             if stack_mode not in {"none", "best", "nlmeans"}:
                 stack_mode = "none"
             pyramid_tile_px = max(128, min(4096, int(pyramid_tile_px)))
+            capture_settle_ms = max(0, min(5000, int(capture_settle_ms)))
             downsample = 1
             tiff_comp = "none"
             mesh_nx = 3
@@ -253,6 +264,7 @@ class ScanTabMixin:
                 stack_mode=str(stack_mode),
                 stitch_method=str(getattr(self, "_scan_stitch_method_var", tk.StringVar(value="bed")).get()).strip()
                 or "bed",
+                capture_settle_ms=int(capture_settle_ms),
                 downsample=int(downsample),
                 build_pyramidal_tiff=bool(self._scan_build_pyramid_var.get()),
                 build_deepzoom=bool(self._scan_build_deepzoom_var.get()),
@@ -278,6 +290,7 @@ class ScanTabMixin:
             self._scan_shots_var,
             self._scan_stack_var,
             getattr(self, "_scan_stitch_method_var", tk.StringVar(value="bed")),
+            self._scan_capture_settle_ms_var,
             self._scan_build_pyramid_var,
             self._scan_build_deepzoom_var,
             self._scan_pyramid_tile_var,
@@ -335,6 +348,7 @@ class ScanTabMixin:
             stack_mode = str(self._scan_stack_var.get()).strip().lower() or "none"
             pyramid_tile_px = int(float(self._scan_pyramid_tile_var.get()))
             mesh_txt = str(self._scan_focus_mesh_var.get()).strip().lower().replace("×", "x")
+            capture_settle_ms = int(float(self._scan_capture_settle_ms_var.get()))
         except Exception:
             messagebox.showerror("Scan", "One or more scan parameters are invalid.")
             return
@@ -351,6 +365,7 @@ class ScanTabMixin:
         if stack_mode not in {"none", "best", "nlmeans"}:
             stack_mode = "none"
         pyramid_tile_px = max(128, min(4096, int(pyramid_tile_px)))
+        capture_settle_ms = max(0, min(5000, int(capture_settle_ms)))
         downsample = 1
         tiff_comp = "none"
         mesh_nx = 3
@@ -386,6 +401,7 @@ class ScanTabMixin:
             stack_mode=str(stack_mode),
             stitch_method=str(getattr(self, "_scan_stitch_method_var", tk.StringVar(value="bed")).get()).strip()
             or "bed",
+            capture_settle_ms=int(capture_settle_ms),
             downsample=int(downsample),
             build_pyramidal_tiff=bool(self._scan_build_pyramid_var.get()),
             build_deepzoom=bool(self._scan_build_deepzoom_var.get()),
@@ -464,7 +480,28 @@ class ScanTabMixin:
         total_y = max(0.0, float(ny - 1) * float(params.step_y_mm))
         move_time = (total_x + total_y) / max(1e-6, speed_xy)
 
-        capture_time = float(total) * (float(params.shots_per_tile) / cam_fps)
+        # Per-tile capture overhead: we intentionally drop a few buffered frames after motion,
+        # then wait a small settle interval before capturing frames for the tile.
+        try:
+            cfg_settle_s = float(getattr(self, "_cam_config").af_settle_ms) / 1000.0  # type: ignore[attr-defined]
+        except Exception:
+            cfg_settle_s = 0.0
+        warmup_frames = max(2, min(8, int(round(float(cam_fps) * 0.12))))
+        auto_settle_s = max(min(0.2, 1.0 / float(cam_fps)), min(0.2, max(0.0, float(cfg_settle_s))))
+        try:
+            capture_settle_ms = int(float(getattr(params, "capture_settle_ms", 0)))
+        except Exception:
+            capture_settle_ms = 0
+        capture_settle_ms = max(0, min(5000, int(capture_settle_ms)))
+        if capture_settle_ms > 0:
+            motion_settle_s = min(5.0, float(capture_settle_ms) / 1000.0)
+        else:
+            motion_settle_s = float(auto_settle_s)
+        motion_settle_s = max(1.0 / float(cam_fps), float(motion_settle_s))
+
+        capture_time = float(total) * (
+            (float(warmup_frames) + 1.0 + float(params.shots_per_tile)) / float(cam_fps) + float(motion_settle_s)
+        )
 
         af_time = 0.0
         calib_time = 0.0
@@ -644,8 +681,20 @@ class ScanTabMixin:
             cfg_settle_s = float(getattr(self, "_cam_config").af_settle_ms) / 1000.0  # type: ignore[attr-defined]
         except Exception:
             cfg_settle_s = 0.0
-        # Ensure at least ~one frame interval of time after motion before trusting captured frames.
-        motion_settle_s = max(min(0.2, 1.0 / float(cam_fps)), min(0.2, max(0.0, float(cfg_settle_s))))
+        # Settle time after motion before trusting captured frames.
+        # - If capture_settle_ms is 0, derive a small default from fps + camera AF settle.
+        # - If set (>0), use it (still ensure at least one frame interval).
+        try:
+            capture_settle_ms = int(float(getattr(params, "capture_settle_ms", 0)))
+        except Exception:
+            capture_settle_ms = 0
+        capture_settle_ms = max(0, min(5000, int(capture_settle_ms)))
+        auto_settle_s = max(min(0.2, 1.0 / float(cam_fps)), min(0.2, max(0.0, float(cfg_settle_s))))
+        if capture_settle_ms > 0:
+            motion_settle_s = min(5.0, float(capture_settle_ms) / 1000.0)
+        else:
+            motion_settle_s = float(auto_settle_s)
+        motion_settle_s = max(1.0 / float(cam_fps), float(motion_settle_s))
 
         def flush_frames(n: int, *, timeout_s: float = 1.0) -> None:
             nonlocal last_seq
@@ -1233,6 +1282,40 @@ class ScanTabMixin:
             except Exception:
                 pass
 
+        def _write_deepzoom_viewer() -> None:
+            """Write a tiny OpenSeadragon viewer HTML next to the scan outputs."""
+            try:
+                html_path = os.path.join(out_dir, "deepzoom_viewer.html")
+                dzi_rel = "deepzoom/mosaic.dzi"
+                html = f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeepZoom Viewer</title>
+    <style>
+      html, body, #osd {{ width: 100%; height: 100%; margin: 0; background: #111; }}
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/openseadragon.min.js"></script>
+  </head>
+  <body>
+    <div id="osd"></div>
+    <script>
+      OpenSeadragon({{
+        id: "osd",
+        prefixUrl: "https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/images/",
+        tileSources: "{dzi_rel}",
+        showNavigator: true
+      }});
+    </script>
+  </body>
+</html>
+"""
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+            except Exception:
+                pass
+
         by_rc: dict[tuple[int, int], dict[str, object]] = {}
         max_r = 0
         max_c = 0
@@ -1424,10 +1507,8 @@ class ScanTabMixin:
 
             paths = [str(by_rc[rc]["path"]) for rc in sorted(by_rc.keys(), key=lambda rc: (rc[0], rc[1]))]
 
-            try:
-                import cv2  # type: ignore
-            except Exception as exc:
-                raise RuntimeError("OpenCV (cv2) is required for the OpenCV stitch method.") from exc
+            if cv2 is None:
+                raise RuntimeError("OpenCV (cv2) is required for the OpenCV stitch method.")
 
             # Best-effort settings tuned for planar (scanner-like) mosaics.
             # Note: This can be slow for large grids and may skip tiles if they have too little texture.
@@ -1441,7 +1522,7 @@ class ScanTabMixin:
                 "compensator": "no",
                 "blender_type": "multiband",
                 "blend_strength": 5,
-                "medium_megapix": 2.0,
+                "medium_megapix": 100.0,  # keep full-res features (no upscaling)
                 "low_megapix": 0.2,
                 "final_megapix": -1,
             }
@@ -1454,26 +1535,131 @@ class ScanTabMixin:
                 "compensator": "no",
                 "blender_type": "multiband",
                 "blend_strength": 5,
-                "medium_megapix": 2.0,
+                "medium_megapix": 100.0,  # keep full-res features (no upscaling)
                 "low_megapix": 0.2,
                 "final_megapix": -1,
             }
 
             pano_bgr = None
             settings_used: dict[str, object] | None = None
-            try:
-                stitcher = AffineStitcher(**settings_sift)
-                pano_bgr = stitcher.stitch(paths)
-                settings_used = settings_sift
-            except Exception as exc:
-                _append_err("opencv_stitch_sift", exc)
+            dropped_note: dict[str, object] = {}
+
+            def _is_flann_knn_error(exc: Exception) -> bool:
+                msg = str(exc)
+                return ("knn <= index_->size" in msg) or ("runKnnSearch_" in msg)
+
+            def _filter_low_feature_paths(
+                paths_in: list[str], *, settings_in: dict[str, object]
+            ) -> tuple[list[str], list[str]]:
+                """Drop tiles with too-few detected features (prevents OpenCV FLANN knn assertion)."""
+                keep: list[str] = []
+                drop: list[str] = []
+
                 try:
-                    stitcher = AffineStitcher(**settings_orb)
+                    from stitching.feature_detector import FeatureDetector  # type: ignore
+                    from stitching.images import Images  # type: ignore
+
+                    det_name = str(settings_in.get("detector", "")).strip().lower() or "orb"
+                    nfeat = int(settings_in.get("nfeatures", 5000))
+                    med_mp = float(settings_in.get("medium_megapix", 100.0))
+                    low_mp = float(settings_in.get("low_megapix", 0.2))
+                    fin_mp = float(settings_in.get("final_megapix", -1))
+
+                    imgs = Images.of(paths_in, medium_megapix=float(med_mp), low_megapix=float(low_mp), final_megapix=float(fin_mp))
+                    med_iter = imgs.resize(Images.Resolution.MEDIUM)
+                    finder = (
+                        FeatureDetector(det_name, nfeatures=int(nfeat))
+                        if det_name in {"orb", "sift"}
+                        else FeatureDetector(det_name)
+                    )
+
+                    for p, img in zip(paths_in, med_iter, strict=False):
+                        try:
+                            feats = finder.detect_features(img)
+                            n = len(feats.getKeypoints())
+                        except Exception:
+                            n = 0
+                        if int(n) < 2:
+                            drop.append(p)
+                        else:
+                            keep.append(p)
+                    return (keep, drop)
+                except Exception:
+                    # Fallback: quick grayscale feature count (may be less accurate than stitching's pipeline).
+                    det_name = str(settings_in.get("detector", "")).strip().lower() or "orb"
+                    try:
+                        nfeat = int(settings_in.get("nfeatures", 5000))
+                    except Exception:
+                        nfeat = 5000
+                    det = None
+                    try:
+                        if det_name == "sift":
+                            det = cv2.SIFT_create(nfeatures=int(nfeat))
+                        else:
+                            det = cv2.ORB_create(nfeatures=int(nfeat), fastThreshold=5)
+                    except Exception:
+                        det = None
+
+                    max_w = 1600
+                    for p in paths_in:
+                        img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+                        if img is None or det is None:
+                            drop.append(p)
+                            continue
+                        h, w = img.shape[:2]
+                        if w > int(max_w):
+                            scale = float(max_w) / float(w)
+                            new_w = max(64, int(round(float(w) * float(scale))))
+                            new_h = max(64, int(round(float(h) * float(scale))))
+                            img = cv2.resize(img, (int(new_w), int(new_h)), interpolation=cv2.INTER_AREA)
+                        try:
+                            _kps, des = det.detectAndCompute(img, None)
+                        except Exception:
+                            des = None
+                        if des is None or int(len(des)) < 2:
+                            drop.append(p)
+                        else:
+                            keep.append(p)
+                    return (keep, drop)
+
+            def _record_dropped(detector_name: str, dropped: list[str], kept: list[str]) -> None:
+                if not dropped:
+                    return
+                try:
+                    dropped_note[detector_name] = {
+                        "dropped_count": int(len(dropped)),
+                        "kept_count": int(len(kept)),
+                        "dropped_files": [os.path.basename(p) for p in dropped],
+                    }
+                    with open(os.path.join(out_dir, "opencv_dropped_tiles.json"), "w", encoding="utf-8") as f:
+                        json.dump(dropped_note, f, indent=2, sort_keys=True)
+                except Exception:
+                    pass
+
+            def _try_stitch(settings_in: dict[str, object], label: str) -> tuple[object | None, dict[str, object] | None]:
+                nonlocal pano_bgr
+                try:
+                    stitcher = AffineStitcher(**settings_in)
                     pano_bgr = stitcher.stitch(paths)
-                    settings_used = settings_orb
-                except Exception as exc2:
-                    _append_err("opencv_stitch_orb", exc2)
-                    pano_bgr = None
+                    return pano_bgr, settings_in
+                except Exception as exc:
+                    _append_err(label, exc)
+                    if _is_flann_knn_error(exc):
+                        det_name = str(settings_in.get("detector", "")).strip().lower() or "orb"
+                        kept, dropped = _filter_low_feature_paths(paths, settings_in=settings_in)
+                        _record_dropped(det_name, dropped, kept)
+                        if len(kept) >= 2 and len(kept) < len(paths):
+                            try:
+                                stitcher = AffineStitcher(**settings_in)
+                                pano_bgr = stitcher.stitch(kept)
+                                return pano_bgr, settings_in
+                            except Exception as exc2:
+                                _append_err(f"{label}_filtered", exc2)
+                    return None, None
+
+            pano_bgr, settings_used = _try_stitch(settings_sift, "opencv_stitch_sift")
+            if pano_bgr is None:
+                pano_bgr, settings_used = _try_stitch(settings_orb, "opencv_stitch_orb")
 
             if pano_bgr is None:
                 # Fall back to the bed-based stitcher so the user still gets outputs.
@@ -1512,6 +1698,7 @@ class ScanTabMixin:
                     "size_px": [int(w), int(h)],
                     "downsample": int(ds),
                     "settings": settings,
+                    "filtered_tiles": (None if not dropped_note else dropped_note),
                 }
                 try:
                     with open(os.path.join(out_dir, "stitch_meta.json"), "w", encoding="utf-8") as f:
@@ -1549,6 +1736,7 @@ class ScanTabMixin:
                     dz_base = os.path.join(dz_root, "mosaic")
                     try:
                         mosaic.dzsave(dz_base, tile_size=256, overlap=1, suffix=".png")
+                        _write_deepzoom_viewer()
                     except Exception as exc:
                         _append_err("dzsave", exc)
                         raise
@@ -1995,6 +2183,7 @@ class ScanTabMixin:
             dz_base = os.path.join(dz_root, "mosaic")
             try:
                 mosaic.dzsave(dz_base, tile_size=256, overlap=1, suffix=".png")
+                _write_deepzoom_viewer()
             except Exception as exc:
                 _write_err("dzsave", exc)
                 raise

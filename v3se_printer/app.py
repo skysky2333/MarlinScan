@@ -236,6 +236,7 @@ class PrinterGUI(
         self._scan_shots_var = tk.StringVar(value="1")
         self._scan_stack_var = tk.StringVar(value="none")
         self._scan_stitch_method_var = tk.StringVar(value="bed")
+        self._scan_capture_settle_ms_var = tk.StringVar(value="0")
         self._scan_downsample_var = tk.StringVar(value="1")
         self._scan_build_pyramid_var = tk.BooleanVar(value=True)
         self._scan_build_deepzoom_var = tk.BooleanVar(value=False)
