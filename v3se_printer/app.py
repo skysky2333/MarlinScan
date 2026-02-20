@@ -181,7 +181,7 @@ class PrinterGUI(
         self._temp_var = tk.StringVar(value="Hotend:?/?°C  Bed:?/?°C")
         self._auto_poll_var = tk.BooleanVar(value=True)
         self._poll_interval_var = tk.StringVar(value="1.0")
-        self._confirm_motion_var = tk.BooleanVar(value=True)
+        self._confirm_motion_var = tk.BooleanVar(value=False)
         self._bed_click_move_var = tk.BooleanVar(value=False)
 
         self._coord_mode_var = tk.StringVar(value="absolute")
@@ -223,25 +223,28 @@ class PrinterGUI(
         # Scan tab (camera tile scan) UI state.
         self._scan_status_var = tk.StringVar(value="Scan: Idle")
         self._scan_estimate_var = tk.StringVar(value="Estimate: —")
+        self._scan_stitch_progress_var = tk.DoubleVar(value=0.0)
+        self._scan_stitch_progress_text_var = tk.StringVar(value="Stitching: idle")
         self._scan_x_min_var = tk.DoubleVar(value=float(self._bed_x_min_var.get()))
         self._scan_x_max_var = tk.DoubleVar(value=float(self._bed_x_max_var.get()))
         self._scan_y_min_var = tk.DoubleVar(value=float(self._bed_y_min_var.get()))
         self._scan_y_max_var = tk.DoubleVar(value=float(self._bed_y_max_var.get()))
-        self._scan_step_x_var = tk.StringVar(value="10")
-        self._scan_step_y_var = tk.StringVar(value="10")
+        self._scan_step_x_var = tk.StringVar(value="1")
+        self._scan_step_y_var = tk.StringVar(value="2")
         self._scan_serpentine_var = tk.BooleanVar(value=True)
         self._scan_focus_plane_var = tk.BooleanVar(value=False)
         self._scan_focus_mesh_var = tk.StringVar(value="3x3")
         self._scan_af_each_tile_var = tk.BooleanVar(value=True)
         self._scan_shots_var = tk.StringVar(value="1")
         self._scan_stack_var = tk.StringVar(value="none")
-        self._scan_stitch_method_var = tk.StringVar(value="bed")
-        self._scan_capture_settle_ms_var = tk.StringVar(value="0")
-        self._scan_downsample_var = tk.StringVar(value="1")
+        self._scan_capture_settle_ms_var = tk.StringVar(value="10")
         self._scan_build_pyramid_var = tk.BooleanVar(value=True)
         self._scan_build_deepzoom_var = tk.BooleanVar(value=False)
-        self._scan_pyramid_tile_var = tk.StringVar(value="512")
-        self._scan_tiff_compression_var = tk.StringVar(value="none")
+        self._scan_tiff_compression_var = tk.StringVar(value="lzw")
+        # DeepZoom pyramid output.
+        self._scan_deepzoom_tile_var = tk.StringVar(value="512")
+        self._scan_deepzoom_format_var = tk.StringVar(value="jpg")
+        self._scan_deepzoom_jpeg_quality_var = tk.StringVar(value="80")
         self._scan_out_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "scans"))
 
         self._target_x_var = tk.DoubleVar(value=0.0)
@@ -3279,6 +3282,23 @@ class PrinterGUI(
                         pass
                 elif kind == "scan-status":
                     self._scan_status_var.set(str(payload))
+                elif kind == "scan-stitch-progress":
+                    pct = None
+                    msg = None
+                    if isinstance(payload, tuple) and len(payload) == 2:
+                        pct, msg = payload  # type: ignore[misc]
+                    else:
+                        msg = str(payload)
+                    try:
+                        if pct is not None:
+                            self._scan_stitch_progress_var.set(float(pct))
+                    except Exception:
+                        pass
+                    try:
+                        if msg is not None:
+                            self._scan_stitch_progress_text_var.set(str(msg))
+                    except Exception:
+                        pass
                 elif kind == "scan-finished":
                     ok_flag = False
                     msg = ""

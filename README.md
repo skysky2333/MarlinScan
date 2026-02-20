@@ -18,7 +18,7 @@ Small Tkinter app for sending G-code over serial to a Marlin-based printer (test
 
 - `v3se_printer/app.py`: main Tkinter app + serial worker integration
 - `v3se_printer/ui/`: tab builders and realtime control logic (split out of the old monolithic GUI file)
-- `v3se_printer/gui.py`: backwards-compatible wrapper (re-exports `main` / `PrinterGUI`)
+- `v3se_printer/scan/`: non-UI scan capture + stitching helpers
 
 ## Safety
 

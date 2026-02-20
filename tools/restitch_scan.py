@@ -3,7 +3,42 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+
+
+_TILE_RE = re.compile(
+    r"^tile_r(?P<row>\d+)_c(?P<col>\d+)_x(?P<x>-?\d+(?:\.\d+)?)_y(?P<y>-?\d+(?:\.\d+)?)\.(?:tif|png)$"
+)
+
+
+def _infer_tiles_from_dir(scan_dir: str) -> list[dict[str, object]]:
+    tiles: list[dict[str, object]] = []
+    try:
+        with os.scandir(scan_dir) as it:
+            for ent in it:
+                if not ent.is_file():
+                    continue
+                name = ent.name
+                m = _TILE_RE.match(name)
+                if not m:
+                    continue
+                try:
+                    tiles.append(
+                        {
+                            "row": int(m.group("row")),
+                            "col": int(m.group("col")),
+                            "x_mm": float(m.group("x")),
+                            "y_mm": float(m.group("y")),
+                            "file": str(name),
+                        }
+                    )
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    tiles.sort(key=lambda t: (int(t.get("row", 0)), int(t.get("col", 0))))
+    return tiles
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -13,23 +48,22 @@ def main(argv: list[str] | None = None) -> int:
         sys.path.insert(0, repo_root)
 
     ap = argparse.ArgumentParser(description="Rebuild stitched outputs for an existing scan folder (tiles.json).")
-    ap.add_argument("scan_dir", help="Path to a scan folder (contains tiles.json and tile_*.tif).")
-    ap.add_argument("--pyramid", action="store_true", help="Build pyramidal BigTIFF (mosaic_pyramid.tif).")
-    ap.add_argument("--deepzoom", action="store_true", help="Build DeepZoom tiles (deepzoom/mosaic.dzi + files).")
-    ap.add_argument("--tile-px", type=int, default=512, help="Internal TIFF tile size in pixels (default: 512).")
+    ap.add_argument("scan_dir", help="Path to a scan folder (contains tiles.json and tile_*.tif/.png).")
+    ap.add_argument("--pyramid", action="store_true", help="Keep stitched TIFF (mosaic_full.tif).")
+    ap.add_argument(
+        "--deepzoom",
+        action="store_true",
+        help="Build DeepZoom viewer (deepzoom/manifest.json + deepzoom/mosaic.dzi).",
+    )
     ap.add_argument(
         "--compression",
         choices=["none", "lzw", "deflate"],
-        default="none",
-        help="TIFF compression for pyramidal output (default: none).",
+        default="lzw",
+        help="TIFF compression for stitched outputs (default: lzw).",
     )
-    ap.add_argument(
-        "--method",
-        choices=["bed", "opencv"],
-        default="bed",
-        help="Stitching method (default: bed). 'opencv' uses the stitching package and can be slow/experimental.",
-    )
-    ap.add_argument("--downsample", type=int, default=1, help="Stitch downsample factor (default: 1 = full-res).")
+    ap.add_argument("--dz-tile-px", type=int, default=512, help="DeepZoom tile size in pixels (default: 512).")
+    ap.add_argument("--dz-format", choices=["jpg", "png"], default="jpg", help="DeepZoom tile format (default: jpg).")
+    ap.add_argument("--dz-jpeg-quality", type=int, default=80, help="DeepZoom JPEG quality 1..100 (default: 80).")
     args = ap.parse_args(argv)
 
     scan_dir = os.path.abspath(os.path.expanduser(str(args.scan_dir)))
@@ -37,16 +71,25 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.isdir(scan_dir):
         print(f"Error: not a directory: {scan_dir}", file=sys.stderr)
         return 2
-    if not os.path.exists(tiles_path):
-        print(f"Error: tiles.json not found: {tiles_path}", file=sys.stderr)
-        return 2
-
-    try:
-        with open(tiles_path, "r", encoding="utf-8") as f:
-            tiles = json.load(f)
-    except Exception as exc:
-        print(f"Error: failed to read tiles.json: {exc}", file=sys.stderr)
-        return 2
+    tiles = None
+    if os.path.exists(tiles_path):
+        try:
+            with open(tiles_path, "r", encoding="utf-8") as f:
+                tiles = json.load(f)
+        except Exception as exc:
+            print(f"Error: failed to read tiles.json: {exc}", file=sys.stderr)
+            tiles = None
+    if not isinstance(tiles, list) or not tiles:
+        tiles = _infer_tiles_from_dir(scan_dir)
+        if not tiles:
+            print(f"Error: no tiles found (tiles.json missing and no tile_*.tif files parsed): {scan_dir}", file=sys.stderr)
+            return 2
+        # Best-effort: write tiles.json for future runs.
+        try:
+            with open(tiles_path, "w", encoding="utf-8") as f:
+                json.dump(tiles, f, indent=2, sort_keys=False)
+        except Exception:
+            pass
 
     build_pyramid = bool(args.pyramid)
     build_deepzoom = bool(args.deepzoom)
@@ -56,31 +99,18 @@ def main(argv: list[str] | None = None) -> int:
         build_deepzoom = True
 
     try:
-        from v3se_printer.ui.scan import ScanTabMixin
+        from v3se_printer.scan.stitch_outputs import stitch_scan_outputs
 
-        # This stitching helper does not depend on Tk state; call it as an unbound method.
-        ScanTabMixin._scan_stitch_outputs(  # type: ignore[misc]
-            None,
+        stitch_scan_outputs(
             tiles=list(tiles) if isinstance(tiles, list) else [],
             out_dir=str(scan_dir),
-            downsample=int(args.downsample),
             build_pyramidal_tiff=bool(build_pyramid),
             build_deepzoom=bool(build_deepzoom),
-            pyramid_tile_px=int(args.tile_px),
             tiff_compression=str(args.compression),
-            stitch_method=str(args.method),
+            deepzoom_tile_px=int(args.dz_tile_px),
+            deepzoom_format=str(args.dz_format),
+            deepzoom_jpeg_quality=int(args.dz_jpeg_quality),
         )
-        try:
-            meta_path = os.path.join(scan_dir, "stitch_meta.json")
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            if (
-                str(meta.get("requested_method", "")).strip().lower() == "opencv"
-                and str(meta.get("method", "")).strip().lower() == "bed"
-            ):
-                print("Note: OpenCV stitch failed; used bed fallback (see stitch_error.txt).")
-        except Exception:
-            pass
     except Exception as exc:
         print(f"Stitch failed: {exc}", file=sys.stderr)
         err_path = os.path.join(scan_dir, "stitch_error.txt")
