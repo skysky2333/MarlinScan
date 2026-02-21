@@ -35,10 +35,5 @@ class ScanParams:
     capture_settle_ms: int  # 0 = auto (derived from fps / camera settle)
     downsample: int  # reserved; currently always 1 (full-res)
     build_pyramidal_tiff: bool
-    build_deepzoom: bool
     tiff_compression: str  # "none" | "lzw" | "deflate"
-    # DeepZoom (pyramid output).
-    deepzoom_tile_px: int
-    deepzoom_format: str  # "jpg" | "png"
-    deepzoom_jpeg_quality: int  # 1..100 (only when format=jpg)
     out_base_dir: str

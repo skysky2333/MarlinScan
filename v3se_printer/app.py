@@ -239,12 +239,7 @@ class PrinterGUI(
         self._scan_stack_var = tk.StringVar(value="none")
         self._scan_capture_settle_ms_var = tk.StringVar(value="10")
         self._scan_build_pyramid_var = tk.BooleanVar(value=True)
-        self._scan_build_deepzoom_var = tk.BooleanVar(value=False)
         self._scan_tiff_compression_var = tk.StringVar(value="lzw")
-        # DeepZoom pyramid output.
-        self._scan_deepzoom_tile_var = tk.StringVar(value="512")
-        self._scan_deepzoom_format_var = tk.StringVar(value="jpg")
-        self._scan_deepzoom_jpeg_quality_var = tk.StringVar(value="80")
         self._scan_out_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "scans"))
 
         self._target_x_var = tk.DoubleVar(value=0.0)

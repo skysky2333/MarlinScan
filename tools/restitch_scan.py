@@ -50,11 +50,6 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Rebuild stitched outputs for an existing scan folder (tiles.json).")
     ap.add_argument("scan_dir", help="Path to a scan folder (contains tiles.json and tile_*.tif/.png).")
     ap.add_argument("--pyramid", action="store_true", help="Keep stitched TIFF (mosaic_full.tif).")
-    ap.add_argument(
-        "--deepzoom",
-        action="store_true",
-        help="Build DeepZoom viewer (deepzoom/manifest.json + deepzoom/mosaic.dzi).",
-    )
     ap.add_argument("--crop", action="store_true", help="Crop panorama to largest interior rectangle (default: off).")
     ap.add_argument(
         "--confidence-threshold",
@@ -67,6 +62,32 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Limit pairwise matching to neighbors within this index distance (default: auto).",
+    )
+    ap.add_argument(
+        "--max-direct-tiles",
+        type=int,
+        default=None,
+        help="Max tiles to stitch in one pass before switching to layout mode (default: auto).",
+    )
+    ap.add_argument("--final-megapix", type=float, default=None, help="Final resolution per input image (MP; default: auto).")
+    ap.add_argument(
+        "--medium-megapix",
+        type=float,
+        default=None,
+        help="Medium resolution per input image (MP; affects features; default: auto).",
+    )
+    ap.add_argument("--low-megapix", type=float, default=None, help="Low resolution per input image (MP; default: auto).")
+    ap.add_argument(
+        "--detector",
+        choices=["orb", "sift", "brisk", "akaze"],
+        default=None,
+        help="Feature detector (default: auto).",
+    )
+    ap.add_argument(
+        "--finder",
+        choices=["dp_color", "dp_colorgrad", "gc_color", "gc_colorgrad", "voronoi", "no"],
+        default=None,
+        help="Seam finder (default: auto).",
     )
     ap.add_argument("--nfeatures", type=int, default=None, help="ORB features per image (default: auto).")
     ap.add_argument(
@@ -82,6 +103,42 @@ def main(argv: list[str] | None = None) -> int:
         help="Match 4-neighbors (R/D) or 8-neighbors (adds diagonals) for tile grids (default: auto).",
     )
     ap.add_argument(
+        "--layout-megapix",
+        type=float,
+        default=None,
+        help="Megapix used to estimate step vectors for large scans (default: auto).",
+    )
+    ap.add_argument(
+        "--layout-samples",
+        type=int,
+        default=None,
+        help="Number of neighbor pairs to sample per direction for layout (default: auto).",
+    )
+    ap.add_argument(
+        "--layout-nfeatures",
+        type=int,
+        default=None,
+        help="ORB features per image for layout step estimation (default: auto).",
+    )
+    ap.add_argument(
+        "--layout-min-inliers",
+        type=int,
+        default=None,
+        help="Min RANSAC inliers to accept a layout step estimate (default: auto).",
+    )
+    ap.add_argument(
+        "--layout-blend",
+        choices=["overwrite", "average"],
+        default=None,
+        help="Compositing mode for layout stitching (default: overwrite).",
+    )
+    ap.add_argument(
+        "--layout-seed",
+        type=int,
+        default=None,
+        help="RNG seed for layout sampling (default: 0).",
+    )
+    ap.add_argument(
         "--blender-type",
         choices=["multiband", "no"],
         default=None,
@@ -94,9 +151,6 @@ def main(argv: list[str] | None = None) -> int:
         default="lzw",
         help="TIFF compression for stitched outputs (default: lzw).",
     )
-    ap.add_argument("--dz-tile-px", type=int, default=512, help="DeepZoom tile size in pixels (default: 512).")
-    ap.add_argument("--dz-format", choices=["jpg", "png"], default="jpg", help="DeepZoom tile format (default: jpg).")
-    ap.add_argument("--dz-jpeg-quality", type=int, default=80, help="DeepZoom JPEG quality 1..100 (default: 80).")
     args = ap.parse_args(argv)
 
     scan_dir = os.path.abspath(os.path.expanduser(str(args.scan_dir)))
@@ -125,14 +179,14 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     build_pyramid = bool(args.pyramid)
-    build_deepzoom = bool(args.deepzoom)
-    if not build_pyramid and not build_deepzoom:
-        # Default to both when no explicit output was requested.
+    if not build_pyramid:
         build_pyramid = True
-        build_deepzoom = True
 
     try:
         from v3se_printer.scan.stitch_outputs import stitch_scan_outputs
+
+        def _progress(pct: float, msg: str) -> None:
+            print(f"{pct:5.1f}% {msg}", file=sys.stderr)
 
         stitch_settings: dict[str, object] = {}
         if bool(args.crop):
@@ -141,12 +195,36 @@ def main(argv: list[str] | None = None) -> int:
             stitch_settings["confidence_threshold"] = float(args.confidence_threshold)
         if args.range_width is not None:
             stitch_settings["range_width"] = int(args.range_width)
+        if args.max_direct_tiles is not None:
+            stitch_settings["max_direct_tiles"] = int(args.max_direct_tiles)
+        if args.final_megapix is not None:
+            stitch_settings["final_megapix"] = float(args.final_megapix)
+        if args.medium_megapix is not None:
+            stitch_settings["medium_megapix"] = float(args.medium_megapix)
+        if args.low_megapix is not None:
+            stitch_settings["low_megapix"] = float(args.low_megapix)
+        if args.detector is not None:
+            stitch_settings["detector"] = str(args.detector)
+        if args.finder is not None:
+            stitch_settings["finder"] = str(args.finder)
         if args.nfeatures is not None:
             stitch_settings["nfeatures"] = int(args.nfeatures)
         if args.orb_fast_threshold is not None:
             stitch_settings["orb_fast_threshold"] = int(args.orb_fast_threshold)
         if args.neighbor_match is not None:
             stitch_settings["neighbor_match"] = str(args.neighbor_match)
+        if args.layout_megapix is not None:
+            stitch_settings["layout_megapix"] = float(args.layout_megapix)
+        if args.layout_samples is not None:
+            stitch_settings["layout_samples"] = int(args.layout_samples)
+        if args.layout_nfeatures is not None:
+            stitch_settings["layout_nfeatures"] = int(args.layout_nfeatures)
+        if args.layout_min_inliers is not None:
+            stitch_settings["layout_min_inliers"] = int(args.layout_min_inliers)
+        if args.layout_blend is not None:
+            stitch_settings["layout_blend"] = str(args.layout_blend)
+        if args.layout_seed is not None:
+            stitch_settings["layout_seed"] = int(args.layout_seed)
         if args.blender_type is not None:
             stitch_settings["blender_type"] = str(args.blender_type)
         if args.blend_strength is not None:
@@ -156,11 +234,8 @@ def main(argv: list[str] | None = None) -> int:
             tiles=list(tiles) if isinstance(tiles, list) else [],
             out_dir=str(scan_dir),
             build_pyramidal_tiff=bool(build_pyramid),
-            build_deepzoom=bool(build_deepzoom),
             tiff_compression=str(args.compression),
-            deepzoom_tile_px=int(args.dz_tile_px),
-            deepzoom_format=str(args.dz_format),
-            deepzoom_jpeg_quality=int(args.dz_jpeg_quality),
+            progress_cb=_progress,
             stitch_settings=stitch_settings or None,
         )
     except Exception as exc:

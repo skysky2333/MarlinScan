@@ -576,7 +576,7 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
         except Exception:
             pass
 
-        if (params.build_pyramidal_tiff or params.build_deepzoom) and tiles:
+        if bool(params.build_pyramidal_tiff) and tiles:
             stitch_ok = True
             status("Scan: stitching (this can take a while)…")
             try:
@@ -584,11 +584,7 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
                     tiles=tiles,
                     out_dir=out_dir,
                     build_pyramidal_tiff=bool(params.build_pyramidal_tiff),
-                    build_deepzoom=bool(params.build_deepzoom),
                     tiff_compression=str(params.tiff_compression),
-                    deepzoom_tile_px=int(params.deepzoom_tile_px),
-                    deepzoom_format=str(params.deepzoom_format),
-                    deepzoom_jpeg_quality=int(params.deepzoom_jpeg_quality),
                     progress_cb=stitch_progress,
                 )
             except Exception as exc:
@@ -608,7 +604,7 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
             else:
                 status("Scan: stitching failed (you can restitch later).")
 
-        if (params.build_pyramidal_tiff or params.build_deepzoom) and tiles and not stitch_ok:
+        if bool(params.build_pyramidal_tiff) and tiles and not stitch_ok:
             finish(
                 True,
                 f"Scan complete: {len(tiles)}/{total} tiles saved to {out_dir} (stitching failed; see stitch_error.txt)",

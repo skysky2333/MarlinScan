@@ -18,8 +18,8 @@ class ScanTabMixin:
             intro,
             text=(
                 "Captures full-resolution tiles across the work area. Optional per-tile autofocus.\n"
-                "Tiles are saved as TIFF (lossless; compression configurable). Optional stitching uses OpenCV's affine (feature-based) stitcher.\n"
-                "Output: DeepZoom tiles (JPG/PNG) + manifest; optional stitched TIFF (mosaic_full.tif)."
+                "Tiles are saved as TIFF (lossless; compression configurable). Optional stitching uses an affine stitcher (feature-based for smaller scans; affine layout for larger scans).\n"
+                "Output: stitched TIFF (mosaic_full.tif)."
             ),
             justify=tk.LEFT,
         ).pack(side=tk.TOP, anchor=tk.W)
@@ -99,34 +99,10 @@ class ScanTabMixin:
         ttk.Checkbutton(stitch, text="Keep stitched TIFF (mosaic_full.tif)", variable=self._scan_build_pyramid_var).grid(
             row=0, column=0, columnspan=6, sticky=tk.W
         )
-        ttk.Checkbutton(stitch, text="Build DeepZoom tiles (pyramid)", variable=self._scan_build_deepzoom_var).grid(
-            row=1, column=0, columnspan=6, sticky=tk.W, pady=(6, 0)
-        )
 
         ttk.Label(stitch, text="Stitching:").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
-        ttk.Label(stitch, text="Affine (feature-based) stitcher (OpenCV stitching pipeline)").grid(
+        ttk.Label(stitch, text="Affine stitcher (auto)").grid(
             row=2, column=1, columnspan=5, sticky=tk.W, padx=(6, 0), pady=(8, 0)
-        )
-
-        ttk.Label(stitch, text="DeepZoom tile (px):").grid(row=3, column=0, sticky=tk.W, pady=(6, 0))
-        ttk.Combobox(
-            stitch,
-            textvariable=self._scan_deepzoom_tile_var,
-            values=["256", "512", "1024", "2048"],
-            width=8,
-            state="normal",
-        ).grid(row=3, column=1, sticky=tk.W, padx=(6, 12), pady=(6, 0))
-        ttk.Label(stitch, text="Format:").grid(row=3, column=2, sticky=tk.W, pady=(6, 0))
-        ttk.Combobox(
-            stitch,
-            textvariable=self._scan_deepzoom_format_var,
-            values=["jpg", "png"],
-            width=8,
-            state="readonly",
-        ).grid(row=3, column=3, sticky=tk.W, padx=(6, 12), pady=(6, 0))
-        ttk.Label(stitch, text="JPEG quality:").grid(row=3, column=4, sticky=tk.W, pady=(6, 0))
-        ttk.Entry(stitch, textvariable=self._scan_deepzoom_jpeg_quality_var, width=8).grid(
-            row=3, column=5, sticky=tk.W, padx=(6, 0), pady=(6, 0)
         )
 
         out = ttk.LabelFrame(parent, text="Output", padding=10)
@@ -195,9 +171,6 @@ class ScanTabMixin:
                 step_y = float(self._scan_step_y_var.get())
                 shots = int(float(self._scan_shots_var.get()))
                 stack_mode = str(self._scan_stack_var.get()).strip().lower() or "none"
-                deepzoom_tile_px = int(float(self._scan_deepzoom_tile_var.get()))
-                dz_fmt = str(self._scan_deepzoom_format_var.get()).strip().lower() or "jpg"
-                dz_q = int(float(self._scan_deepzoom_jpeg_quality_var.get()))
                 mesh_txt = str(self._scan_focus_mesh_var.get()).strip().lower().replace("×", "x")
                 capture_settle_ms = int(float(self._scan_capture_settle_ms_var.get()))
                 out_base = (self._scan_out_dir_var.get().strip() or "").strip() or os.path.join(os.getcwd(), "scans")
@@ -217,10 +190,6 @@ class ScanTabMixin:
                 shots = 1
             if stack_mode not in {"none", "best", "nlmeans"}:
                 stack_mode = "none"
-            deepzoom_tile_px = max(128, min(4096, int(deepzoom_tile_px)))
-            if dz_fmt not in {"jpg", "png"}:
-                dz_fmt = "jpg"
-            dz_q = max(1, min(100, int(dz_q)))
             capture_settle_ms = max(0, min(5000, int(capture_settle_ms)))
             downsample = 1
             try:
@@ -259,11 +228,7 @@ class ScanTabMixin:
                 capture_settle_ms=int(capture_settle_ms),
                 downsample=int(downsample),
                 build_pyramidal_tiff=bool(self._scan_build_pyramid_var.get()),
-                build_deepzoom=bool(self._scan_build_deepzoom_var.get()),
                 tiff_compression=str(tiff_comp),
-                deepzoom_tile_px=int(deepzoom_tile_px),
-                deepzoom_format=str(dz_fmt),
-                deepzoom_jpeg_quality=int(dz_q),
                 out_base_dir=str(out_base),
             )
 
@@ -285,10 +250,6 @@ class ScanTabMixin:
             self._scan_stack_var,
             self._scan_capture_settle_ms_var,
             self._scan_build_pyramid_var,
-            self._scan_build_deepzoom_var,
-            self._scan_deepzoom_tile_var,
-            self._scan_deepzoom_format_var,
-            self._scan_deepzoom_jpeg_quality_var,
             self._scan_tiff_compression_var,
             self._scan_out_dir_var,
         ):
@@ -342,9 +303,6 @@ class ScanTabMixin:
             step_y = float(self._scan_step_y_var.get())
             shots = int(float(self._scan_shots_var.get()))
             stack_mode = str(self._scan_stack_var.get()).strip().lower() or "none"
-            deepzoom_tile_px = int(float(self._scan_deepzoom_tile_var.get()))
-            dz_fmt = str(self._scan_deepzoom_format_var.get()).strip().lower() or "jpg"
-            dz_q = int(float(self._scan_deepzoom_jpeg_quality_var.get()))
             mesh_txt = str(self._scan_focus_mesh_var.get()).strip().lower().replace("×", "x")
             capture_settle_ms = int(float(self._scan_capture_settle_ms_var.get()))
         except Exception:
@@ -362,10 +320,6 @@ class ScanTabMixin:
             shots = 1
         if stack_mode not in {"none", "best", "nlmeans"}:
             stack_mode = "none"
-        deepzoom_tile_px = max(128, min(4096, int(deepzoom_tile_px)))
-        if dz_fmt not in {"jpg", "png"}:
-            dz_fmt = "jpg"
-        dz_q = max(1, min(100, int(dz_q)))
         capture_settle_ms = max(0, min(5000, int(capture_settle_ms)))
         downsample = 1
         try:
@@ -408,11 +362,7 @@ class ScanTabMixin:
             capture_settle_ms=int(capture_settle_ms),
             downsample=int(downsample),
             build_pyramidal_tiff=bool(self._scan_build_pyramid_var.get()),
-            build_deepzoom=bool(self._scan_build_deepzoom_var.get()),
             tiff_compression=str(tiff_comp),
-            deepzoom_tile_px=int(deepzoom_tile_px),
-            deepzoom_format=str(dz_fmt),
-            deepzoom_jpeg_quality=int(dz_q),
             out_base_dir=str(out_base),
         )
 
