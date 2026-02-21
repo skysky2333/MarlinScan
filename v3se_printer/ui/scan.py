@@ -18,7 +18,7 @@ class ScanTabMixin:
             intro,
             text=(
                 "Captures full-resolution tiles across the work area. Optional per-tile autofocus.\n"
-                "Tiles are saved as TIFF (lossless; compression configurable). Optional stitching uses phase correlation alignment + 2×2 pyramid compose.\n"
+                "Tiles are saved as TIFF (lossless; compression configurable). Optional stitching uses OpenCV's affine (feature-based) stitcher.\n"
                 "Output: DeepZoom tiles (JPG/PNG) + manifest; optional stitched TIFF (mosaic_full.tif)."
             ),
             justify=tk.LEFT,
@@ -104,7 +104,7 @@ class ScanTabMixin:
         )
 
         ttk.Label(stitch, text="Stitching:").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
-        ttk.Label(stitch, text="Phase correlation alignment + overwrite compose (2×2 pyramid; keeps sharpness)").grid(
+        ttk.Label(stitch, text="Affine (feature-based) stitcher (OpenCV stitching pipeline)").grid(
             row=2, column=1, columnspan=5, sticky=tk.W, padx=(6, 0), pady=(8, 0)
         )
 

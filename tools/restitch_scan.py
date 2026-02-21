@@ -55,6 +55,39 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Build DeepZoom viewer (deepzoom/manifest.json + deepzoom/mosaic.dzi).",
     )
+    ap.add_argument("--crop", action="store_true", help="Crop panorama to largest interior rectangle (default: off).")
+    ap.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=None,
+        help="Match confidence threshold for including edges/images (default: auto).",
+    )
+    ap.add_argument(
+        "--range-width",
+        type=int,
+        default=None,
+        help="Limit pairwise matching to neighbors within this index distance (default: auto).",
+    )
+    ap.add_argument("--nfeatures", type=int, default=None, help="ORB features per image (default: auto).")
+    ap.add_argument(
+        "--orb-fast-threshold",
+        type=int,
+        default=None,
+        help="ORB FAST threshold (lower finds more keypoints; default: auto).",
+    )
+    ap.add_argument(
+        "--neighbor-match",
+        choices=["4", "8"],
+        default=None,
+        help="Match 4-neighbors (R/D) or 8-neighbors (adds diagonals) for tile grids (default: auto).",
+    )
+    ap.add_argument(
+        "--blender-type",
+        choices=["multiband", "no"],
+        default=None,
+        help="Blending type (default: auto).",
+    )
+    ap.add_argument("--blend-strength", type=float, default=None, help="Blending strength (default: auto).")
     ap.add_argument(
         "--compression",
         choices=["none", "lzw", "deflate"],
@@ -101,6 +134,24 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from v3se_printer.scan.stitch_outputs import stitch_scan_outputs
 
+        stitch_settings: dict[str, object] = {}
+        if bool(args.crop):
+            stitch_settings["crop"] = True
+        if args.confidence_threshold is not None:
+            stitch_settings["confidence_threshold"] = float(args.confidence_threshold)
+        if args.range_width is not None:
+            stitch_settings["range_width"] = int(args.range_width)
+        if args.nfeatures is not None:
+            stitch_settings["nfeatures"] = int(args.nfeatures)
+        if args.orb_fast_threshold is not None:
+            stitch_settings["orb_fast_threshold"] = int(args.orb_fast_threshold)
+        if args.neighbor_match is not None:
+            stitch_settings["neighbor_match"] = str(args.neighbor_match)
+        if args.blender_type is not None:
+            stitch_settings["blender_type"] = str(args.blender_type)
+        if args.blend_strength is not None:
+            stitch_settings["blend_strength"] = float(args.blend_strength)
+
         stitch_scan_outputs(
             tiles=list(tiles) if isinstance(tiles, list) else [],
             out_dir=str(scan_dir),
@@ -110,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             deepzoom_tile_px=int(args.dz_tile_px),
             deepzoom_format=str(args.dz_format),
             deepzoom_jpeg_quality=int(args.dz_jpeg_quality),
+            stitch_settings=stitch_settings or None,
         )
     except Exception as exc:
         print(f"Stitch failed: {exc}", file=sys.stderr)
