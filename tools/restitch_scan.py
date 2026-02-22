@@ -69,7 +69,40 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Max tiles to stitch in one pass before switching to layout mode (default: auto).",
     )
-    ap.add_argument("--final-megapix", type=float, default=None, help="Final resolution per input image (MP; default: auto).")
+    ap.add_argument(
+        "--max-panorama-pixels",
+        type=int,
+        default=None,
+        help="Safety cap for stitched mosaic pixels (default: 2000000000). Increase for full-res big scans (risk: huge RAM/disk).",
+    )
+    ap.add_argument(
+        "--final-megapix",
+        type=float,
+        default=None,
+        help="Final resolution per input image (MP). Use -1 for full-res (default: auto).",
+    )
+    ap.add_argument(
+        "--lossless",
+        action="store_true",
+        help="Convenience flag: try full-res output (sets --final-megapix -1 and disables averaging).",
+    )
+    ap.add_argument(
+        "--dpi",
+        type=float,
+        default=None,
+        help="Override output DPI/PPI metadata written into mosaic_full.tif (default: auto).",
+    )
+    ap.add_argument(
+        "--dpi-round-px-per-mm",
+        type=float,
+        default=None,
+        help="Round estimated px/mm to this increment before writing DPI (helps match PPI across patches).",
+    )
+    ap.add_argument(
+        "--no-memmap",
+        action="store_true",
+        help="Disable scratch-file backing for huge mosaics (not recommended).",
+    )
     ap.add_argument(
         "--medium-megapix",
         type=float,
@@ -128,9 +161,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--layout-blend",
-        choices=["overwrite", "average"],
+        choices=["overwrite", "average", "feather"],
         default=None,
         help="Compositing mode for layout stitching (default: overwrite).",
+    )
+    ap.add_argument(
+        "--layout-feather-px",
+        type=int,
+        default=None,
+        help="Feather width in px (final resolution) for --layout-blend feather (default: 200).",
     )
     ap.add_argument(
         "--layout-seed",
@@ -150,6 +189,34 @@ def main(argv: list[str] | None = None) -> int:
         choices=["none", "lzw", "deflate"],
         default="lzw",
         help="TIFF compression for stitched outputs (default: lzw).",
+    )
+    ap.add_argument(
+        "--tiff-tile",
+        action="store_true",
+        help="Force tiled TIFF output (default: auto).",
+    )
+    ap.add_argument(
+        "--tiff-strip",
+        action="store_true",
+        help="Force strip-based TIFF output (default: auto).",
+    )
+    ap.add_argument(
+        "--tiff-tile-width",
+        type=int,
+        default=None,
+        help="Tile width (px) when writing tiled TIFFs (default: 256).",
+    )
+    ap.add_argument(
+        "--tiff-tile-height",
+        type=int,
+        default=None,
+        help="Tile height (px) when writing tiled TIFFs (default: 256).",
+    )
+    ap.add_argument(
+        "--tiff-predictor",
+        choices=["none", "horizontal", "float"],
+        default=None,
+        help="TIFF predictor (default: auto).",
     )
     args = ap.parse_args(argv)
 
@@ -197,8 +264,20 @@ def main(argv: list[str] | None = None) -> int:
             stitch_settings["range_width"] = int(args.range_width)
         if args.max_direct_tiles is not None:
             stitch_settings["max_direct_tiles"] = int(args.max_direct_tiles)
+        if args.max_panorama_pixels is not None:
+            stitch_settings["max_panorama_pixels"] = int(args.max_panorama_pixels)
         if args.final_megapix is not None:
             stitch_settings["final_megapix"] = float(args.final_megapix)
+        if bool(getattr(args, "lossless", False)):
+            stitch_settings["final_megapix"] = -1.0
+            stitch_settings["layout_blend"] = "overwrite"
+            stitch_settings["blender_type"] = "no"
+        if bool(getattr(args, "no_memmap", False)):
+            stitch_settings["use_memmap"] = False
+        if args.dpi is not None:
+            stitch_settings["output_dpi"] = float(args.dpi)
+        if args.dpi_round_px_per_mm is not None:
+            stitch_settings["dpi_round_px_per_mm"] = float(args.dpi_round_px_per_mm)
         if args.medium_megapix is not None:
             stitch_settings["medium_megapix"] = float(args.medium_megapix)
         if args.low_megapix is not None:
@@ -223,12 +302,27 @@ def main(argv: list[str] | None = None) -> int:
             stitch_settings["layout_min_inliers"] = int(args.layout_min_inliers)
         if args.layout_blend is not None:
             stitch_settings["layout_blend"] = str(args.layout_blend)
+        if args.layout_feather_px is not None:
+            stitch_settings["layout_feather_px"] = int(args.layout_feather_px)
         if args.layout_seed is not None:
             stitch_settings["layout_seed"] = int(args.layout_seed)
         if args.blender_type is not None:
             stitch_settings["blender_type"] = str(args.blender_type)
         if args.blend_strength is not None:
             stitch_settings["blend_strength"] = float(args.blend_strength)
+        if bool(getattr(args, "tiff_tile", False)) and bool(getattr(args, "tiff_strip", False)):
+            print("Error: pass only one of --tiff-tile / --tiff-strip", file=sys.stderr)
+            return 2
+        if bool(getattr(args, "tiff_tile", False)):
+            stitch_settings["tiff_tile"] = True
+        elif bool(getattr(args, "tiff_strip", False)):
+            stitch_settings["tiff_tile"] = False
+        if args.tiff_tile_width is not None:
+            stitch_settings["tiff_tile_width"] = int(args.tiff_tile_width)
+        if args.tiff_tile_height is not None:
+            stitch_settings["tiff_tile_height"] = int(args.tiff_tile_height)
+        if args.tiff_predictor is not None:
+            stitch_settings["tiff_predictor"] = str(args.tiff_predictor)
 
         stitch_scan_outputs(
             tiles=list(tiles) if isinstance(tiles, list) else [],

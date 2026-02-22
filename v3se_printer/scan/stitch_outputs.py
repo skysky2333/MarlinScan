@@ -5,6 +5,8 @@ import json
 import math
 import os
 import shutil
+import subprocess
+import sys
 import time
 import traceback
 from dataclasses import dataclass
@@ -23,6 +25,38 @@ def _tiff_imwrite_params(cv2: object, *, compression: str) -> list[int]:
     elif comp == "deflate":
         code = 8
     return [int(getattr(cv2, "IMWRITE_TIFF_COMPRESSION")), int(code)]
+
+
+def _median(vals: list[float]) -> float:
+    vals2 = sorted(float(v) for v in vals)
+    if not vals2:
+        return 0.0
+    mid = int(len(vals2) // 2)
+    if (len(vals2) % 2) == 1:
+        return float(vals2[mid])
+    return 0.5 * float(vals2[mid - 1] + vals2[mid])
+
+
+def _try_set_dpi(path: str, *, dpi_x: float, dpi_y: float) -> bool:
+    """
+    Best-effort: set TIFF DPI metadata without touching pixel data.
+
+    On macOS we use `sips`, which (empirically) preserves pixels for TIFF.
+    """
+    try:
+        if sys.platform != "darwin":
+            return False
+        if not shutil.which("sips"):
+            return False
+        subprocess.run(
+            ["sips", "-s", "dpiWidth", str(float(dpi_x)), "-s", "dpiHeight", str(float(dpi_y)), str(path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -107,7 +141,13 @@ def stitch_scan_outputs(
 
     # Clear stale outputs.
     try:
-        for fn in ("stitch_error.txt", "stitch_meta.json", "mosaic_full.tif"):
+        for fn in (
+            "stitch_error.txt",
+            "stitch_meta.json",
+            "mosaic_full.tif",
+            "_mosaic_memmap.dat",
+            "mosaic_thumb_2000.jpg",
+        ):
             p = os.path.join(out_dir, fn)
             if os.path.exists(p):
                 os.remove(p)
@@ -120,6 +160,7 @@ def stitch_scan_outputs(
     entries: list[_Entry] = []
     max_r = -1
     max_c = -1
+    mm_by_rc: dict[tuple[int, int], tuple[float, float]] = {}
     for t in tiles:
         try:
             r = int(t["row"])
@@ -131,6 +172,13 @@ def stitch_scan_outputs(
         if not os.path.exists(p):
             continue
         entries.append(_Entry(int(r), int(c), str(p)))
+        try:
+            x_mm = float(t.get("x_mm"))  # type: ignore[arg-type]
+            y_mm = float(t.get("y_mm"))  # type: ignore[arg-type]
+            if math.isfinite(float(x_mm)) and math.isfinite(float(y_mm)):
+                mm_by_rc[(int(r), int(c))] = (float(x_mm), float(y_mm))
+        except Exception:
+            pass
         max_r = max(int(max_r), int(r))
         max_c = max(int(max_c), int(c))
 
@@ -161,10 +209,16 @@ def stitch_scan_outputs(
     tile_count_total = int(len(entries))
     is_small = bool(int(tile_count_total) <= int(max_direct_tiles))
 
-    default_final_megapix = 0.05 if is_small else 0.03
-    stage1_final_megapix = float(s_in.get("final_megapix", default_final_megapix))
-    if stage1_final_megapix <= 0:
-        stage1_final_megapix = float(default_final_megapix)
+    final_megapix_user: float | None = None
+    try:
+        v = s_in.get("final_megapix", None)
+    except Exception:
+        v = None
+    if v is not None:
+        try:
+            final_megapix_user = float(v)
+        except Exception:
+            final_megapix_user = None
 
     # Stitcher knobs (passed through to `AffineStitcher`).
     base_stitcher_settings: dict[str, object] = {
@@ -181,6 +235,63 @@ def stitch_scan_outputs(
         "low_megapix": float(s_in.get("low_megapix", 0.1 if is_small else 0.05)),
     }
     orb_fast_threshold = s_in.get("orb_fast_threshold", None)
+
+    def _infer_step_mm_from_tiles() -> tuple[float | None, float | None]:
+        dxs: list[float] = []
+        dys: list[float] = []
+        for (r, c), (x1, y1) in mm_by_rc.items():
+            p2 = mm_by_rc.get((int(r), int(c + 1)))
+            if p2 is not None:
+                x2, _y2 = p2
+                dx = abs(float(x2) - float(x1))
+                if float(dx) > 1e-9 and math.isfinite(dx):
+                    dxs.append(float(dx))
+            p3 = mm_by_rc.get((int(r + 1), int(c)))
+            if p3 is not None:
+                _x3, y3 = p3
+                dy = abs(float(y3) - float(y1))
+                if float(dy) > 1e-9 and math.isfinite(dy):
+                    dys.append(float(dy))
+        sx = float(_median(dxs)) if dxs else None
+        sy = float(_median(dys)) if dys else None
+        if sx is not None and float(sx) <= 0:
+            sx = None
+        if sy is not None and float(sy) <= 0:
+            sy = None
+        return sx, sy
+
+    # Physical step (mm) for computing output PPI/DPI metadata.
+    step_x_mm: float | None = None
+    step_y_mm: float | None = None
+    serpentine: bool | None = None
+    try:
+        with open(os.path.join(out_dir, "scan_params.json"), "r", encoding="utf-8") as f:
+            scan_params = json.load(f)
+        if isinstance(scan_params, dict):
+            try:
+                step_x_mm = float(scan_params.get("step_x_mm"))  # type: ignore[arg-type]
+            except Exception:
+                step_x_mm = None
+            try:
+                step_y_mm = float(scan_params.get("step_y_mm"))  # type: ignore[arg-type]
+            except Exception:
+                step_y_mm = None
+            try:
+                serpentine = bool(scan_params.get("serpentine"))  # type: ignore[arg-type]
+            except Exception:
+                serpentine = None
+    except Exception:
+        pass
+    if step_x_mm is not None and (not math.isfinite(step_x_mm) or float(step_x_mm) <= 0):
+        step_x_mm = None
+    if step_y_mm is not None and (not math.isfinite(step_y_mm) or float(step_y_mm) <= 0):
+        step_y_mm = None
+    if step_x_mm is None or step_y_mm is None:
+        sx2, sy2 = _infer_step_mm_from_tiles()
+        if step_x_mm is None:
+            step_x_mm = sx2
+        if step_y_mm is None:
+            step_y_mm = sy2
 
     def _build_match_mask(rc_list: list[tuple[int, int]], *, use_diag: bool) -> "np.ndarray | None":
         if len(rc_list) <= 1:
@@ -216,6 +327,289 @@ def stitch_scan_outputs(
         if int(nw) == int(w) and int(nh) == int(h):
             return img
         return cv2.resize(img, (int(nw), int(nh)), interpolation=cv2.INTER_AREA)
+
+    def _estimate_step_vectors(
+        *,
+        final_megapix: float,
+        min_kept: int,
+    ) -> dict[str, object] | None:
+        """
+        Estimate per-step translation vectors between neighboring tiles, then scale the vectors to
+        the requested final resolution.
+
+        Returns a dict containing:
+        - step_col_px / step_row_px (dx, dy) at the final resolution
+        - layout_* parameters and sampling stats
+        """
+        import random
+
+        layout_seed = int(s_in.get("layout_seed", 0))
+        layout_megapix = float(s_in.get("layout_megapix", max(float(final_megapix), 0.2)))
+        layout_samples = int(s_in.get("layout_samples", 250))
+        layout_nfeatures = int(s_in.get("layout_nfeatures", 2000))
+        layout_orb_fast_threshold = int(s_in.get("layout_orb_fast_threshold", 10))
+        layout_ratio_test = float(s_in.get("layout_ratio_test", 0.75))
+        layout_ransac_thresh = float(s_in.get("layout_ransac_thresh", 3.0))
+        layout_min_inliers = int(s_in.get("layout_min_inliers", 10))
+
+        def _scale_for_mp(target_mp: float) -> float:
+            if float(target_mp) <= 0:
+                return 1.0
+            s = math.sqrt(float(target_mp) / float(orig_mp))
+            return max(0.02, min(1.0, float(s)))
+
+        scale_final = float(_scale_for_mp(float(final_megapix)))
+        scale_match = float(_scale_for_mp(float(layout_megapix)))
+        if float(scale_match) <= 1e-9:
+            scale_match = float(scale_final)
+        ratio = float(scale_final) / float(scale_match)
+
+        w_match = max(1, int(round(float(tile_w) * float(scale_match))))
+        h_match = max(1, int(round(float(tile_h) * float(scale_match))))
+        w_final = max(1.0, float(tile_w) * float(scale_final))
+        h_final = max(1.0, float(tile_h) * float(scale_final))
+        max_step = 1.25 * float(max(w_final, h_final))
+
+        orb = cv2.ORB_create(nfeatures=int(layout_nfeatures), fastThreshold=int(layout_orb_fast_threshold))
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+
+        rng = random.Random(int(layout_seed))
+        try:
+            cv2.setRNGSeed(int(layout_seed))
+        except Exception:
+            pass
+
+        feat_cache: dict[str, tuple[object | None, "np.ndarray | None"]] = {}
+        gray_cache: dict[str, "np.ndarray | None"] = {}
+        try:
+            pc_window = cv2.createHanningWindow((int(w_match), int(h_match)), cv2.CV_32F)
+        except Exception:
+            pc_window = None
+
+        def _get_orb(path: str) -> tuple[object | None, "np.ndarray | None"]:
+            cached = feat_cache.get(path)
+            if cached is not None:
+                return cached
+            img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                feat_cache[path] = (None, None)
+                return (None, None)
+            try:
+                if int(img.shape[1]) != int(w_match) or int(img.shape[0]) != int(h_match):
+                    img = cv2.resize(img, (int(w_match), int(h_match)), interpolation=cv2.INTER_AREA)
+            except Exception:
+                pass
+            try:
+                kps, des = orb.detectAndCompute(img, None)
+            except Exception:
+                kps, des = None, None
+            feat_cache[path] = (kps, des)
+            return kps, des
+
+        def _get_gray(path: str) -> "np.ndarray | None":
+            cached = gray_cache.get(path)
+            if cached is not None:
+                return cached
+            img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                gray_cache[path] = None
+                return None
+            try:
+                if int(img.shape[1]) != int(w_match) or int(img.shape[0]) != int(h_match):
+                    img = cv2.resize(img, (int(w_match), int(h_match)), interpolation=cv2.INTER_AREA)
+            except Exception:
+                pass
+            try:
+                out = img.astype(np.float32)
+            except Exception:
+                out = None
+            gray_cache[path] = out
+            return out
+
+        def _estimate_pair_shift(p1: str, p2: str) -> tuple[float, float, int] | None:
+            k1, d1 = _get_orb(p1)
+            k2, d2 = _get_orb(p2)
+            # Try feature-based affine first.
+            if d1 is not None and d2 is not None and k1 is not None and k2 is not None:
+                try:
+                    if len(d1) >= 2 and len(d2) >= 2:
+                        knn = bf.knnMatch(d1, d2, k=2)
+                        good = []
+                        for a, b in knn:
+                            try:
+                                if float(a.distance) < float(layout_ratio_test) * float(b.distance):
+                                    good.append(a)
+                            except Exception:
+                                continue
+                        if len(good) >= 8:
+                            pts1 = np.float32([k1[m.queryIdx].pt for m in good])
+                            pts2 = np.float32([k2[m.trainIdx].pt for m in good])
+                            H, inliers = cv2.estimateAffinePartial2D(
+                                pts1,
+                                pts2,
+                                method=cv2.RANSAC,
+                                ransacReprojThreshold=float(layout_ransac_thresh),
+                            )
+                            if H is not None:
+                                try:
+                                    inl = int(inliers.sum()) if inliers is not None else 0
+                                except Exception:
+                                    inl = 0
+                                if int(inl) >= int(layout_min_inliers):
+                                    dx = -float(H[0][2]) * float(ratio)
+                                    dy = -float(H[1][2]) * float(ratio)
+                                    if (
+                                        math.isfinite(dx)
+                                        and math.isfinite(dy)
+                                        and math.hypot(float(dx), float(dy)) <= float(max_step)
+                                    ):
+                                        return float(dx), float(dy), int(inl)
+                except Exception:
+                    pass
+
+            # Fallback: phase correlation (more robust for low-feature tiles).
+            try:
+                img1 = _get_gray(p1)
+                img2 = _get_gray(p2)
+                if img1 is None or img2 is None:
+                    return None
+                a = img2
+                b = img1
+                try:
+                    a = a - float(a.mean())
+                    b = b - float(b.mean())
+                except Exception:
+                    pass
+                if pc_window is not None:
+                    try:
+                        a = a * pc_window
+                        b = b * pc_window
+                    except Exception:
+                        pass
+                (sx, sy), resp = cv2.phaseCorrelate(a, b)
+                if not math.isfinite(float(resp)) or float(resp) < 0.05:
+                    return None
+                dx = float(sx) * float(ratio)
+                dy = float(sy) * float(ratio)
+                if not (math.isfinite(dx) and math.isfinite(dy)):
+                    return None
+                if math.hypot(float(dx), float(dy)) > float(max_step):
+                    return None
+                return float(dx), float(dy), int(layout_min_inliers)
+            except Exception:
+                return None
+
+        def _robust_center(vecs: list[tuple[float, float]]) -> tuple[float, float, int]:
+            if not vecs:
+                return (0.0, 0.0, 0)
+            xs = [float(x) for x, _y in vecs]
+            ys = [float(y) for _x, y in vecs]
+            mx = _median(xs)
+            my = _median(ys)
+            dists = [math.hypot(float(x) - float(mx), float(y) - float(my)) for x, y in vecs]
+            md = _median(dists)
+            mad = _median([abs(float(d) - float(md)) for d in dists])
+            thr = float(md) + (6.0 * max(1.0, float(mad)))
+            kept = [(x, y) for (x, y), d in zip(vecs, dists) if float(d) <= float(thr)]
+            if not kept:
+                return float(mx), float(my), 0
+            xs2 = [float(x) for x, _y in kept]
+            ys2 = [float(y) for _x, y in kept]
+            return float(_median(xs2)), float(_median(ys2)), int(len(kept))
+
+        right_candidates = [(r, c) for r in range(int(nrows)) for c in range(int(ncols) - 1)]
+        down_candidates = [(r, c) for r in range(int(nrows) - 1) for c in range(int(ncols))]
+        rng.shuffle(right_candidates)
+        rng.shuffle(down_candidates)
+
+        right_vecs: list[tuple[float, float]] = []
+        down_vecs: list[tuple[float, float]] = []
+        down_vecs_even: list[tuple[float, float]] = []
+        down_vecs_odd: list[tuple[float, float]] = []
+
+        for r, c in right_candidates[: max(1, int(layout_samples))]:
+            p1 = by_rc.get((int(r), int(c)))
+            p2 = by_rc.get((int(r), int(c + 1)))
+            if not p1 or not p2:
+                continue
+            est = _estimate_pair_shift(str(p1), str(p2))
+            if est is None:
+                continue
+            right_vecs.append((float(est[0]), float(est[1])))
+
+        for r, c in down_candidates[: max(1, int(layout_samples))]:
+            p1 = by_rc.get((int(r), int(c)))
+            p2 = by_rc.get((int(r + 1), int(c)))
+            if not p1 or not p2:
+                continue
+            est = _estimate_pair_shift(str(p1), str(p2))
+            if est is None:
+                continue
+            dxdy = (float(est[0]), float(est[1]))
+            down_vecs.append(dxdy)
+            if (int(r) % 2) == 0:
+                down_vecs_even.append(dxdy)
+            else:
+                down_vecs_odd.append(dxdy)
+
+        v_col_x, v_col_y, n_col = _robust_center(right_vecs)
+        v_row_x, v_row_y, n_row = _robust_center(down_vecs)
+        v_row_even_x, v_row_even_y, n_row_even = _robust_center(down_vecs_even)
+        v_row_odd_x, v_row_odd_y, n_row_odd = _robust_center(down_vecs_odd)
+        need_col = int(ncols) > 1
+        need_row = int(nrows) > 1
+        if bool(need_col) and int(n_col) < int(min_kept):
+            return None
+        if bool(need_row) and int(n_row) < int(min_kept):
+            return None
+
+        # Serpentine scans frequently show a row-parity-dependent shift (backlash). If it looks
+        # significant, keep separate step vectors for even/odd row transitions and use them during
+        # layout instead of a single global row-step.
+        try:
+            parity_pref = s_in.get("layout_row_parity", None)
+        except Exception:
+            parity_pref = None
+        prefer_parity = bool(parity_pref) if parity_pref is not None else bool(serpentine)
+        try:
+            parity_min_kept = int(s_in.get("layout_row_parity_min_kept", 20))
+        except Exception:
+            parity_min_kept = 20
+        parity_used = False
+        if bool(prefer_parity) and int(n_row_even) >= int(parity_min_kept) and int(n_row_odd) >= int(parity_min_kept):
+            diff = math.hypot(float(v_row_even_x) - float(v_row_odd_x), float(v_row_even_y) - float(v_row_odd_y))
+            if math.isfinite(float(diff)) and float(diff) >= (0.01 * float(max(w_final, h_final))):
+                parity_used = True
+
+        out = {
+            "layout_megapix": float(layout_megapix),
+            "layout_samples": int(layout_samples),
+            "layout_seed": int(layout_seed),
+            "layout_orb_nfeatures": int(layout_nfeatures),
+            "layout_orb_fast_threshold": int(layout_orb_fast_threshold),
+            "layout_ratio_test": float(layout_ratio_test),
+            "layout_ransac_thresh": float(layout_ransac_thresh),
+            "layout_min_inliers": int(layout_min_inliers),
+            "step_col_px": [float(v_col_x), float(v_col_y)],
+            "step_row_px": [float(v_row_x), float(v_row_y)],
+            "step_col_samples": int(len(right_vecs)),
+            "step_row_samples": int(len(down_vecs)),
+            "step_col_samples_kept": int(n_col),
+            "step_row_samples_kept": int(n_row),
+        }
+        if bool(parity_used):
+            out.update(
+                {
+                    "layout_row_parity": True,
+                    "step_row_px_even": [float(v_row_even_x), float(v_row_even_y)],
+                    "step_row_px_odd": [float(v_row_odd_x), float(v_row_odd_y)],
+                    "step_row_even_samples": int(len(down_vecs_even)),
+                    "step_row_odd_samples": int(len(down_vecs_odd)),
+                    "step_row_even_samples_kept": int(n_row_even),
+                    "step_row_odd_samples_kept": int(n_row_odd),
+                }
+            )
+        return out
 
     def _run_affine(
         image_paths: list[str],
@@ -517,7 +911,7 @@ def stitch_scan_outputs(
                 if bool(safety):
                     # Sanity-check the final panorama ROI before allocating a huge blender output.
                     try:
-                        max_px = int(float(s_in.get("max_panorama_pixels", 250_000_000)))
+                        max_px = int(float(s_in.get("max_panorama_pixels", 2_000_000_000)))
                         min_x = min(int(c[0]) for c in corners)
                         min_y = min(int(c[1]) for c in corners)
                         max_x = max(int(c[0]) + int(s[0]) for c, s in zip(corners, sizes))
@@ -557,6 +951,26 @@ def stitch_scan_outputs(
         }
         return pano, meta
 
+    # Final resolution (per-tile megapixels).
+    # - If user provides `final_megapix`: respect it (`-1` = full-res).
+    # - Otherwise: auto = full-res by default (subject to `max_panorama_pixels` safety cap).
+    stage1_final_megapix: float
+    if final_megapix_user is not None and math.isfinite(float(final_megapix_user)):
+        if float(final_megapix_user) == -1.0:
+            stage1_final_megapix = -1.0
+        elif float(final_megapix_user) > 0:
+            stage1_final_megapix = float(final_megapix_user)
+        else:
+            final_megapix_user = None
+    else:
+        final_megapix_user = None
+
+    if final_megapix_user is None:
+        # Auto mode:
+        # Default to full-resolution output. If the mosaic would exceed max_panorama_pixels,
+        # we still keep going only if the user explicitly sets a larger cap.
+        stage1_final_megapix = -1.0
+
     # Strategy:
     # - If tiles are small enough: stitch directly (OpenStitching AffineStitcher; neighbor mask).
     # - Otherwise: estimate a global affine grid layout and composite tiles.
@@ -568,10 +982,17 @@ def stitch_scan_outputs(
     strategy_name = "single-pass"
     strategy_settings: dict[str, object] = {}
     method_name = "openstitching-affine"
+    memmap_path: str | None = None
     try:
-        if int(tile_count) <= int(max_direct_tiles):
+        force_layout = bool(s_in.get("force_layout", False)) or (float(stage1_final_megapix) == -1.0)
+        use_layout = bool(force_layout) or (int(tile_count) > int(max_direct_tiles))
+
+        if not bool(use_layout):
             rc_all = [(int(e.row), int(e.col)) for e in entries]
             paths_all = [str(e.path) for e in entries]
+            step_meta = _estimate_step_vectors(final_megapix=float(stage1_final_megapix), min_kept=1)
+            if step_meta is not None:
+                strategy_settings = {"strategy": "step_vectors", "final_megapix": float(stage1_final_megapix), **step_meta}
             _emit_progress(5.0, "Stitching: affine (single pass)…")
             pano, meta0 = _run_affine(
                 paths_all, rc_all, final_megapix=float(stage1_final_megapix), stage_label="full", safety=False
@@ -582,26 +1003,46 @@ def stitch_scan_outputs(
             # This avoids the global bundle-adjustment instability/OOM issues seen with thousands of tiles.
             method_name = "affine-layout"
             strategy_name = "layout"
-
-            import random
-
-            layout_seed = int(s_in.get("layout_seed", 0))
-            layout_megapix = float(s_in.get("layout_megapix", max(float(stage1_final_megapix), 0.2)))
-            layout_samples = int(s_in.get("layout_samples", 250))
-            layout_nfeatures = int(s_in.get("layout_nfeatures", 2000))
-            layout_orb_fast_threshold = int(s_in.get("layout_orb_fast_threshold", 10))
-            layout_ratio_test = float(s_in.get("layout_ratio_test", 0.75))
-            layout_ransac_thresh = float(s_in.get("layout_ransac_thresh", 3.0))
-            layout_min_inliers = int(s_in.get("layout_min_inliers", 10))
-            blend_mode = str(s_in.get("layout_blend", "overwrite")).strip().lower() or "overwrite"
-            if blend_mode not in {"overwrite", "average"}:
+            blend_mode = str(s_in.get("layout_blend", "feather")).strip().lower() or "feather"
+            if blend_mode not in {"overwrite", "average", "feather"}:
                 blend_mode = "overwrite"
-
-            rng = random.Random(int(layout_seed))
             try:
-                cv2.setRNGSeed(int(layout_seed))
+                feather_px = int(s_in.get("layout_feather_px", 200))
             except Exception:
-                pass
+                feather_px = 200
+            feather_px = max(0, int(feather_px))
+
+            _emit_progress(5.0, "Stitching: estimating affine step vectors…")
+            right_possible = int(nrows) * max(0, int(ncols) - 1)
+            down_possible = max(0, int(nrows) - 1) * int(ncols)
+            if (right_possible >= 3 and down_possible >= 3) or (right_possible >= 3 and int(nrows) <= 1) or (down_possible >= 3 and int(ncols) <= 1):
+                layout_min_kept = 3
+            else:
+                layout_min_kept = 1
+            step_meta = _estimate_step_vectors(final_megapix=float(stage1_final_megapix), min_kept=int(layout_min_kept))
+            if step_meta is None:
+                raise RuntimeError(
+                    "Affine layout failed: could not estimate reliable neighbor shifts. "
+                    "Try increasing overlap, increasing layout_megapix, or using SIFT."
+                )
+
+            v_col = (float(step_meta["step_col_px"][0]), float(step_meta["step_col_px"][1]))  # type: ignore[index]
+            v_row = (float(step_meta["step_row_px"][0]), float(step_meta["step_row_px"][1]))  # type: ignore[index]
+            v_row_even: tuple[float, float] | None = None
+            v_row_odd: tuple[float, float] | None = None
+            if "step_row_px_even" in step_meta and "step_row_px_odd" in step_meta:
+                try:
+                    v_row_even = (
+                        float(step_meta["step_row_px_even"][0]),
+                        float(step_meta["step_row_px_even"][1]),
+                    )  # type: ignore[index]
+                    v_row_odd = (
+                        float(step_meta["step_row_px_odd"][0]),
+                        float(step_meta["step_row_px_odd"][1]),
+                    )  # type: ignore[index]
+                except Exception:
+                    v_row_even = None
+                    v_row_odd = None
 
             def _scale_for_mp(target_mp: float) -> float:
                 if float(target_mp) <= 0:
@@ -610,176 +1051,24 @@ def stitch_scan_outputs(
                 return max(0.02, min(1.0, float(s)))
 
             scale_final = float(_scale_for_mp(float(stage1_final_megapix)))
-            scale_match = float(_scale_for_mp(float(layout_megapix)))
-            if float(scale_match) <= 1e-9:
-                scale_match = float(scale_final)
-            ratio = float(scale_final) / float(scale_match)
-
             w_final = max(1, int(round(float(tile_w) * float(scale_final))))
             h_final = max(1, int(round(float(tile_h) * float(scale_final))))
-            w_match = max(1, int(round(float(tile_w) * float(scale_match))))
-            h_match = max(1, int(round(float(tile_h) * float(scale_match))))
 
-            orb = cv2.ORB_create(nfeatures=int(layout_nfeatures), fastThreshold=int(layout_orb_fast_threshold))
-            bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+            strategy_settings = {"strategy": "layout", "final_megapix": float(stage1_final_megapix), **step_meta, "blend": str(blend_mode)}
 
-            feat_cache: dict[str, tuple[object | None, "np.ndarray | None"]] = {}
-
-            def _get_orb(path: str) -> tuple[object | None, "np.ndarray | None"]:
-                cached = feat_cache.get(path)
-                if cached is not None:
-                    return cached
-                img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-                if img is None:
-                    feat_cache[path] = (None, None)
-                    return (None, None)
-                try:
-                    if int(img.shape[1]) != int(w_match) or int(img.shape[0]) != int(h_match):
-                        img = cv2.resize(img, (int(w_match), int(h_match)), interpolation=cv2.INTER_AREA)
-                except Exception:
-                    pass
-                try:
-                    kps, des = orb.detectAndCompute(img, None)
-                except Exception:
-                    kps, des = None, None
-                feat_cache[path] = (kps, des)
-                return kps, des
-
-            def _estimate_pair_shift(p1: str, p2: str) -> tuple[float, float, int] | None:
-                k1, d1 = _get_orb(p1)
-                k2, d2 = _get_orb(p2)
-                if d1 is None or d2 is None or k1 is None or k2 is None:
-                    return None
-                try:
-                    if len(d1) < 2 or len(d2) < 2:
-                        return None
-                except Exception:
-                    return None
-                try:
-                    knn = bf.knnMatch(d1, d2, k=2)
-                except Exception:
-                    return None
-                good = []
-                for a, b in knn:
-                    try:
-                        if float(a.distance) < float(layout_ratio_test) * float(b.distance):
-                            good.append(a)
-                    except Exception:
-                        continue
-                if len(good) < 8:
-                    return None
-                try:
-                    pts1 = np.float32([k1[m.queryIdx].pt for m in good])
-                    pts2 = np.float32([k2[m.trainIdx].pt for m in good])
-                    H, inliers = cv2.estimateAffinePartial2D(
-                        pts1,
-                        pts2,
-                        method=cv2.RANSAC,
-                        ransacReprojThreshold=float(layout_ransac_thresh),
-                    )
-                except Exception:
-                    return None
-                if H is None:
-                    return None
-                try:
-                    inl = int(inliers.sum()) if inliers is not None else 0
-                except Exception:
-                    inl = 0
-                if int(inl) < int(layout_min_inliers):
-                    return None
-                dx = -float(H[0][2]) * float(ratio)
-                dy = -float(H[1][2]) * float(ratio)
-                if not (math.isfinite(dx) and math.isfinite(dy)):
-                    return None
-                return float(dx), float(dy), int(inl)
-
-            def _median(vals: list[float]) -> float:
-                vals2 = sorted(float(v) for v in vals)
-                if not vals2:
-                    return 0.0
-                mid = len(vals2) // 2
-                if len(vals2) % 2 == 1:
-                    return float(vals2[mid])
-                return 0.5 * float(vals2[mid - 1] + vals2[mid])
-
-            def _robust_center(vecs: list[tuple[float, float]]) -> tuple[float, float, int]:
-                if not vecs:
-                    return (0.0, 0.0, 0)
-                xs = [float(x) for x, _y in vecs]
-                ys = [float(y) for _x, y in vecs]
-                mx = _median(xs)
-                my = _median(ys)
-                dists = [math.hypot(float(x) - float(mx), float(y) - float(my)) for x, y in vecs]
-                md = _median(dists)
-                mad = _median([abs(float(d) - float(md)) for d in dists])
-                thr = float(md) + (6.0 * max(1.0, float(mad)))
-                kept = [(x, y) for (x, y), d in zip(vecs, dists) if float(d) <= float(thr)]
-                if len(kept) < 3:
-                    return float(mx), float(my), int(len(kept))
-                xs2 = [float(x) for x, _y in kept]
-                ys2 = [float(y) for _x, y in kept]
-                return float(_median(xs2)), float(_median(ys2)), int(len(kept))
-
-            # Sample neighbor pairs to estimate the per-step translation vectors.
-            _emit_progress(5.0, "Stitching: estimating affine step vectors…")
-            right_candidates = [(r, c) for r in range(int(nrows)) for c in range(int(ncols) - 1)]
-            down_candidates = [(r, c) for r in range(int(nrows) - 1) for c in range(int(ncols))]
-            rng.shuffle(right_candidates)
-            rng.shuffle(down_candidates)
-
-            right_vecs: list[tuple[float, float]] = []
-            down_vecs: list[tuple[float, float]] = []
-
-            for r, c in right_candidates[: max(1, int(layout_samples))]:
-                p1 = by_rc.get((int(r), int(c)))
-                p2 = by_rc.get((int(r), int(c + 1)))
-                if not p1 or not p2:
-                    continue
-                est = _estimate_pair_shift(str(p1), str(p2))
-                if est is None:
-                    continue
-                right_vecs.append((float(est[0]), float(est[1])))
-
-            for r, c in down_candidates[: max(1, int(layout_samples))]:
-                p1 = by_rc.get((int(r), int(c)))
-                p2 = by_rc.get((int(r + 1), int(c)))
-                if not p1 or not p2:
-                    continue
-                est = _estimate_pair_shift(str(p1), str(p2))
-                if est is None:
-                    continue
-                down_vecs.append((float(est[0]), float(est[1])))
-
-            v_col_x, v_col_y, n_col = _robust_center(right_vecs)
-            v_row_x, v_row_y, n_row = _robust_center(down_vecs)
-            if int(n_col) < 3 or int(n_row) < 3:
-                raise RuntimeError(
-                    "Affine layout failed: could not estimate reliable neighbor shifts. "
-                    "Try increasing overlap, increasing layout_megapix, or using SIFT."
-                )
-
-            v_col = (float(v_col_x), float(v_col_y))
-            v_row = (float(v_row_x), float(v_row_y))
-
-            strategy_settings = {
-                "strategy": "layout",
-                "final_megapix": float(stage1_final_megapix),
-                "layout_megapix": float(layout_megapix),
-                "layout_samples": int(layout_samples),
-                "layout_seed": int(layout_seed),
-                "layout_orb_nfeatures": int(layout_nfeatures),
-                "layout_orb_fast_threshold": int(layout_orb_fast_threshold),
-                "layout_ratio_test": float(layout_ratio_test),
-                "layout_ransac_thresh": float(layout_ransac_thresh),
-                "layout_min_inliers": int(layout_min_inliers),
-                "step_col_px": [float(v_col[0]), float(v_col[1])],
-                "step_row_px": [float(v_row[0]), float(v_row[1])],
-                "step_col_samples": int(len(right_vecs)),
-                "step_row_samples": int(len(down_vecs)),
-                "step_col_samples_kept": int(n_col),
-                "step_row_samples_kept": int(n_row),
-                "blend": str(blend_mode),
-            }
+            # Precompute per-row origins (supports row-parity-dependent steps for serpentine scans).
+            row_prefix: list[tuple[float, float]] = [(0.0, 0.0)]
+            if v_row_even is not None and v_row_odd is not None and int(nrows) > 1:
+                px0 = 0.0
+                py0 = 0.0
+                for rr in range(1, int(nrows)):
+                    step = v_row_even if ((int(rr - 1) % 2) == 0) else v_row_odd
+                    px0 += float(step[0])
+                    py0 += float(step[1])
+                    row_prefix.append((float(px0), float(py0)))
+            else:
+                for rr in range(1, int(nrows)):
+                    row_prefix.append((float(rr) * float(v_row[0]), float(rr) * float(v_row[1])))
 
             # Compute output bounds.
             min_x = float("inf")
@@ -787,8 +1076,9 @@ def stitch_scan_outputs(
             max_x = float("-inf")
             max_y = float("-inf")
             for e in entries:
-                px = (float(e.col) * float(v_col[0])) + (float(e.row) * float(v_row[0]))
-                py = (float(e.col) * float(v_col[1])) + (float(e.row) * float(v_row[1]))
+                base_x, base_y = row_prefix[int(e.row)]
+                px = float(base_x) + (float(e.col) * float(v_col[0]))
+                py = float(base_y) + (float(e.col) * float(v_col[1]))
                 min_x = min(min_x, float(px))
                 min_y = min(min_y, float(py))
                 max_x = max(max_x, float(px))
@@ -798,15 +1088,151 @@ def stitch_scan_outputs(
             out_h = int(math.ceil(float(max_y - min_y) + float(h_final)))
             if out_w <= 0 or out_h <= 0:
                 raise RuntimeError("Affine layout failed: invalid output canvas size.")
-            max_px = int(float(s_in.get("max_panorama_pixels", 250_000_000)))
-            if (int(out_w) * int(out_h)) > int(max_px):
+            max_px = int(float(s_in.get("max_panorama_pixels", 2_000_000_000)))
+            area = int(out_w) * int(out_h)
+            if int(max_px) > 0 and int(area) > int(max_px):
                 raise RuntimeError(
                     f"Affine layout would be too large ({out_w}x{out_h} px). "
-                    "Lower final_megapix or scan a smaller area."
+                    "Lower final_megapix, scan a smaller area, or increase max_panorama_pixels (expect huge RAM/disk)."
                 )
 
             _emit_progress(10.0, f"Stitching: compositing {tile_count} tiles…")
-            pano = np.zeros((int(out_h), int(out_w), 3), dtype=np.uint8)
+            try:
+                pano_bytes = int(area) * 3
+            except Exception:
+                pano_bytes = 0
+            try:
+                inmem_max_bytes = int(float(s_in.get("in_memory_max_bytes", 1.5 * 1024 * 1024 * 1024)))
+            except Exception:
+                inmem_max_bytes = int(1.5 * 1024 * 1024 * 1024)
+            use_memmap = bool(s_in.get("use_memmap", True))
+            if int(pano_bytes) > int(inmem_max_bytes):
+                if not bool(use_memmap):
+                    raise RuntimeError(
+                        f"Panorama canvas is too large for in-memory composition (~{pano_bytes / (1024**3):.1f} GiB). "
+                        "Enable use_memmap or lower final_megapix."
+                    )
+                memmap_path = os.path.join(out_dir, "_mosaic_memmap.dat")
+                try:
+                    if os.path.exists(memmap_path):
+                        os.remove(memmap_path)
+                except Exception:
+                    pass
+                _emit_progress(9.0, f"Stitching: allocating scratch canvas (~{pano_bytes / (1024**3):.1f} GiB)…")
+                try:
+                    pano = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=(int(out_h), int(out_w), 3))
+                except Exception as exc:
+                    _write_err("memmap_alloc", exc)
+                    if is_no_space_error(exc):
+                        raise RuntimeError(
+                            "No space left on device while allocating the scratch canvas for full-res stitching. "
+                            "Free disk space, choose a different output folder, or lower final_megapix."
+                        ) from exc
+                    raise RuntimeError(
+                        f"Failed to allocate scratch canvas for full-res stitching: {exc} (path: {memmap_path})"
+                    ) from exc
+            else:
+                pano = np.zeros((int(out_h), int(out_w), 3), dtype=np.uint8)
+
+            pos_by_rc: dict[tuple[int, int], tuple[int, int]] = {}
+            for e in entries:
+                base_x, base_y = row_prefix[int(e.row)]
+                px = float(base_x) + (float(e.col) * float(v_col[0]))
+                py = float(base_y) + (float(e.col) * float(v_col[1]))
+                x = int(round(float(px) - float(min_x)))
+                y = int(round(float(py) - float(min_y)))
+                pos_by_rc[(int(e.row), int(e.col))] = (int(x), int(y))
+
+            def _rect_subtract(
+                rect: tuple[int, int, int, int],
+                cut: tuple[int, int, int, int],
+            ) -> list[tuple[int, int, int, int]]:
+                rx0, ry0, rx1, ry1 = rect
+                cx0, cy0, cx1, cy1 = cut
+                ix0 = max(int(rx0), int(cx0))
+                iy0 = max(int(ry0), int(cy0))
+                ix1 = min(int(rx1), int(cx1))
+                iy1 = min(int(ry1), int(cy1))
+                if ix1 <= ix0 or iy1 <= iy0:
+                    return [rect]
+                out: list[tuple[int, int, int, int]] = []
+                if iy0 > ry0:
+                    out.append((int(rx0), int(ry0), int(rx1), int(iy0)))
+                if iy1 < ry1:
+                    out.append((int(rx0), int(iy1), int(rx1), int(ry1)))
+                if ix0 > rx0:
+                    out.append((int(rx0), int(iy0), int(ix0), int(iy1)))
+                if ix1 < rx1:
+                    out.append((int(ix1), int(iy0), int(rx1), int(iy1)))
+                return out
+
+            def _feather_overlap_inplace(
+                *,
+                pano_view: "np.ndarray",
+                new_view: "np.ndarray",
+                dx: int,
+                dy: int,
+                feather: int,
+            ) -> None:
+                """
+                Blend new_view onto pano_view within their overlapping ROI, keeping the neighbor
+                (existing) pixels on one side and the new pixels on the other, with a feather band
+                around the overlap center. Operates in-place on pano_view.
+                """
+                oh, ow = pano_view.shape[:2]
+                if oh <= 0 or ow <= 0:
+                    return
+                if abs(int(dx)) >= abs(int(dy)):
+                    axis = "x"
+                    sign = 1 if int(dx) >= 0 else -1
+                    extent = int(ow)
+                else:
+                    axis = "y"
+                    sign = 1 if int(dy) >= 0 else -1
+                    extent = int(oh)
+                if extent <= 0:
+                    return
+                f = max(0, min(int(feather), int(extent // 2)))
+                if int(f) <= 0:
+                    pano_view[:, :] = new_view
+                    return
+                center = int(extent // 2)
+                blend0 = max(0, int(center - f))
+                blend1 = min(int(extent), int(center + f))
+                if blend1 <= blend0:
+                    pano_view[:, :] = new_view
+                    return
+
+                if axis == "x":
+                    # Overlap is a vertical strip; seam is vertical.
+                    if sign > 0:
+                        # current tile is to the right; keep neighbor on left side.
+                        pano_view[:, int(blend1) :] = new_view[:, int(blend1) :]
+                        a = np.linspace(0.0, 1.0, int(blend1 - blend0), dtype=np.float32)
+                    else:
+                        # current tile is to the left; keep neighbor on right side.
+                        pano_view[:, : int(blend0)] = new_view[:, : int(blend0)]
+                        a = np.linspace(1.0, 0.0, int(blend1 - blend0), dtype=np.float32)
+                    a2 = a[None, :, None]
+                    old_band = pano_view[:, int(blend0) : int(blend1)].astype(np.float32)
+                    new_band = new_view[:, int(blend0) : int(blend1)].astype(np.float32)
+                    out = (old_band * (1.0 - a2)) + (new_band * a2)
+                    pano_view[:, int(blend0) : int(blend1)] = np.clip(out, 0, 255).astype(np.uint8)
+                else:
+                    # Overlap is a horizontal strip; seam is horizontal.
+                    if sign > 0:
+                        # current tile is below; keep neighbor on top side.
+                        pano_view[int(blend1) :, :] = new_view[int(blend1) :, :]
+                        a = np.linspace(0.0, 1.0, int(blend1 - blend0), dtype=np.float32)
+                    else:
+                        # current tile is above; keep neighbor on bottom side.
+                        pano_view[: int(blend0), :] = new_view[: int(blend0), :]
+                        a = np.linspace(1.0, 0.0, int(blend1 - blend0), dtype=np.float32)
+                    a2 = a[:, None, None]
+                    old_band = pano_view[int(blend0) : int(blend1), :].astype(np.float32)
+                    new_band = new_view[int(blend0) : int(blend1), :].astype(np.float32)
+                    out = (old_band * (1.0 - a2)) + (new_band * a2)
+                    pano_view[int(blend0) : int(blend1), :] = np.clip(out, 0, 255).astype(np.uint8)
 
             for i, e in enumerate(entries):
                 img = cv2.imread(str(e.path), cv2.IMREAD_COLOR)
@@ -818,10 +1244,9 @@ def stitch_scan_outputs(
                     except Exception:
                         continue
 
-                px = (float(e.col) * float(v_col[0])) + (float(e.row) * float(v_row[0]))
-                py = (float(e.col) * float(v_col[1])) + (float(e.row) * float(v_row[1]))
-                x = int(round(float(px) - float(min_x)))
-                y = int(round(float(py) - float(min_y)))
+                x, y = pos_by_rc.get((int(e.row), int(e.col)), (None, None))  # type: ignore[assignment]
+                if x is None or y is None:
+                    continue
                 if x < 0 or y < 0 or (x + int(w_final)) > int(out_w) or (y + int(h_final)) > int(out_h):
                     continue
 
@@ -836,6 +1261,78 @@ def stitch_scan_outputs(
                         roi[~mask] = img[~mask]
                     except Exception:
                         pano[int(y) : int(y + h_final), int(x) : int(x + w_final)] = img
+                elif blend_mode == "feather":
+                    # Feather seams against already-placed neighbors without overwriting neighbor pixels first.
+                    fpx = max(0, min(int(feather_px), int(min(w_final, h_final) // 2)))
+
+                    x0 = int(x)
+                    y0 = int(y)
+                    x1 = int(x + w_final)
+                    y1 = int(y + h_final)
+
+                    overlaps: list[tuple[tuple[int, int, int, int], tuple[int, int]]] = []
+                    left_xy = pos_by_rc.get((int(e.row), int(e.col) - 1))
+                    if left_xy is not None:
+                        lx, ly = left_xy
+                        ox0 = max(int(x0), int(lx))
+                        oy0 = max(int(y0), int(ly))
+                        ox1 = min(int(x1), int(lx + w_final))
+                        oy1 = min(int(y1), int(ly + h_final))
+                        if ox1 > ox0 and oy1 > oy0:
+                            overlaps.append(((int(ox0), int(oy0), int(ox1), int(oy1)), (int(x0 - lx), int(y0 - ly))))
+
+                    top_xy = pos_by_rc.get((int(e.row) - 1, int(e.col)))
+                    if top_xy is not None:
+                        tx, ty = top_xy
+                        ox0 = max(int(x0), int(tx))
+                        oy0 = max(int(y0), int(ty))
+                        ox1 = min(int(x1), int(tx + w_final))
+                        oy1 = min(int(y1), int(ty + h_final))
+                        if ox1 > ox0 and oy1 > oy0:
+                            overlaps.append(((int(ox0), int(oy0), int(ox1), int(oy1)), (int(x0 - tx), int(y0 - ty))))
+
+                    # Write only non-overlap regions first.
+                    rects: list[tuple[int, int, int, int]] = [(int(x0), int(y0), int(x1), int(y1))]
+                    for (ox0, oy0, ox1, oy1), _dxy in overlaps:
+                        new_rects: list[tuple[int, int, int, int]] = []
+                        for r0 in rects:
+                            new_rects.extend(_rect_subtract(r0, (int(ox0), int(oy0), int(ox1), int(oy1))))
+                        rects = new_rects
+
+                    for rx0, ry0, rx1, ry1 in rects:
+                        if rx1 <= rx0 or ry1 <= ry0:
+                            continue
+                        pano[int(ry0) : int(ry1), int(rx0) : int(rx1)] = img[
+                            int(ry0 - y0) : int(ry1 - y0), int(rx0 - x0) : int(rx1 - x0)
+                        ]
+
+                    # Blend overlaps (if any); otherwise just write the tile.
+                    if not overlaps:
+                        pano[int(y0) : int(y1), int(x0) : int(x1)] = img
+                    elif int(fpx) <= 0:
+                        # No feather band requested; choose the existing pano (neighbor) in overlap.
+                        # Fill the overlap region with the new tile where pano is still empty.
+                        for (ox0, oy0, ox1, oy1), _dxy in overlaps:
+                            roi = pano[int(oy0) : int(oy1), int(ox0) : int(ox1)]
+                            try:
+                                mask = (roi.sum(axis=2) == 0)  # type: ignore[call-arg]
+                                if mask.any():
+                                    roi[mask] = img[int(oy0 - y0) : int(oy1 - y0), int(ox0 - x0) : int(ox1 - x0)][
+                                        mask
+                                    ]
+                            except Exception:
+                                pass
+                    else:
+                        for (ox0, oy0, ox1, oy1), (dx, dy) in overlaps:
+                            pano_view = pano[int(oy0) : int(oy1), int(ox0) : int(ox1)]
+                            new_view = img[int(oy0 - y0) : int(oy1 - y0), int(ox0 - x0) : int(ox1 - x0)]
+                            _feather_overlap_inplace(
+                                pano_view=pano_view,
+                                new_view=new_view,
+                                dx=int(dx),
+                                dy=int(dy),
+                                feather=int(fpx),
+                            )
                 else:
                     pano[int(y) : int(y + h_final), int(x) : int(x + w_final)] = img
 
@@ -850,8 +1347,209 @@ def stitch_scan_outputs(
 
         _emit_progress(92.0, "Stitching: writing mosaic_full.tif…")
         mosaic_path = os.path.join(out_dir, "mosaic_full.tif")
+        H = int(out_h)
+        W = int(out_w)
+
+        # Estimate output DPI (PPI) metadata so stitched outputs can be combined in external tools
+        # without manual scaling. If we're writing via libvips, we set xres/yres at save time to
+        # avoid rewriting pyramid TIFFs.
+        px_per_mm_target: float | None = None
+        dpi_meta: dict[str, object] | None = None
         try:
-            imwrite(cv2, mosaic_path, pano, tiff_params)
+            override_dpi = None
+            try:
+                override_dpi = s_in.get("output_dpi", None)
+            except Exception:
+                override_dpi = None
+            if override_dpi is not None:
+                try:
+                    dpi0 = float(override_dpi)
+                except Exception:
+                    dpi0 = None
+                if dpi0 is not None and math.isfinite(float(dpi0)) and float(dpi0) > 0:
+                    px_per_mm_target = float(dpi0) / 25.4
+                    dpi_meta = {
+                        "dpi_x": float(dpi0),
+                        "dpi_y": float(dpi0),
+                        "mode": "override",
+                        "set_in_file": False,
+                    }
+
+            if dpi_meta is None:
+                step_vecs = None
+                if (
+                    isinstance(strategy_settings, dict)
+                    and "step_col_px" in strategy_settings
+                    and "step_row_px" in strategy_settings
+                ):
+                    step_vecs = strategy_settings
+                if step_vecs is None:
+                    step_vecs = _estimate_step_vectors(final_megapix=float(stage1_final_megapix), min_kept=1)
+
+                if step_vecs is not None:
+                    vx, vy = step_vecs.get("step_col_px", [0.0, 0.0])  # type: ignore[assignment]
+
+                    row_vecs: list[tuple[float, float]] = []
+                    if "step_row_px_even" in step_vecs and "step_row_px_odd" in step_vecs:
+                        try:
+                            row_vecs.append(
+                                (
+                                    float(step_vecs.get("step_row_px_even")[0]),  # type: ignore[index]
+                                    float(step_vecs.get("step_row_px_even")[1]),  # type: ignore[index]
+                                )
+                            )
+                            row_vecs.append(
+                                (
+                                    float(step_vecs.get("step_row_px_odd")[0]),  # type: ignore[index]
+                                    float(step_vecs.get("step_row_px_odd")[1]),  # type: ignore[index]
+                                )
+                            )
+                        except Exception:
+                            row_vecs = []
+                    if not row_vecs:
+                        wx, wy = step_vecs.get("step_row_px", [0.0, 0.0])  # type: ignore[assignment]
+                        row_vecs.append((float(wx), float(wy)))
+
+                    col_mag = math.hypot(float(vx), float(vy))
+                    row_mag = 0.0
+                    if row_vecs:
+                        row_mag = float(sum(math.hypot(float(a), float(b)) for a, b in row_vecs)) / float(len(row_vecs))
+
+                    try:
+                        n_col = int(step_vecs.get("step_col_samples_kept", 0) or 0)  # type: ignore[union-attr]
+                    except Exception:
+                        n_col = 0
+                    try:
+                        n_row = int(step_vecs.get("step_row_samples_kept", 0) or 0)  # type: ignore[union-attr]
+                    except Exception:
+                        n_row = 0
+
+                    px_per_mm_x = None
+                    px_per_mm_y = None
+                    if int(n_col) > 0 and step_x_mm and float(step_x_mm) > 0 and float(col_mag) > 1e-6:
+                        px_per_mm_x = float(col_mag) / float(step_x_mm)
+                    if int(n_row) > 0 and step_y_mm and float(step_y_mm) > 0 and float(row_mag) > 1e-6:
+                        px_per_mm_y = float(row_mag) / float(step_y_mm)
+
+                    if px_per_mm_x is None and px_per_mm_y is not None:
+                        px_per_mm_x = float(px_per_mm_y)
+                    if px_per_mm_y is None and px_per_mm_x is not None:
+                        px_per_mm_y = float(px_per_mm_x)
+
+                    px_per_mm = None
+                    if px_per_mm_x is not None and px_per_mm_y is not None:
+                        px_per_mm = 0.5 * (float(px_per_mm_x) + float(px_per_mm_y))
+                    elif px_per_mm_x is not None:
+                        px_per_mm = float(px_per_mm_x)
+                    elif px_per_mm_y is not None:
+                        px_per_mm = float(px_per_mm_y)
+
+                    if px_per_mm is not None:
+                        try:
+                            inc = float(s_in.get("dpi_round_px_per_mm", 0.0))
+                        except Exception:
+                            inc = 0.0
+                        if float(inc) > 1e-9:
+                            px_per_mm = float(round(float(px_per_mm) / float(inc)) * float(inc))
+
+                        px_per_mm_target = float(px_per_mm)
+                        dpi = float(px_per_mm_target) * 25.4
+                        dpi_meta = {
+                            "dpi_x": float(dpi),
+                            "dpi_y": float(dpi),
+                            "mode": "estimated",
+                            "px_per_mm": float(px_per_mm_target),
+                            "px_per_mm_x": float(px_per_mm_x),
+                            "px_per_mm_y": float(px_per_mm_y),
+                            "step_x_mm": float(step_x_mm) if step_x_mm is not None else None,
+                            "step_y_mm": float(step_y_mm) if step_y_mm is not None else None,
+                            "set_in_file": False,
+                        }
+        except Exception:
+            px_per_mm_target = None
+            dpi_meta = None
+
+        # Write mosaic.
+        try:
+            did_set = False
+            try:
+                if hasattr(pano, "flush"):
+                    pano.flush()  # type: ignore[union-attr]
+            except Exception:
+                pass
+
+            if memmap_path is not None:
+                import pyvips  # type: ignore
+
+                vimg = pyvips.Image.rawload(memmap_path, int(out_w), int(out_h), 3, format="uchar")
+                # cv2 uses BGR; write standard RGB.
+                vimg = vimg[2].bandjoin([vimg[1], vimg[0]])
+                # macOS Preview/QuickLook can render huge tiled TIFFs incorrectly on some systems.
+                # Default to strip-based output for very large mosaics unless the user forces tiling.
+                tiff_tile_pref = None
+                try:
+                    tiff_tile_pref = s_in.get("tiff_tile", None)
+                except Exception:
+                    tiff_tile_pref = None
+                if tiff_tile_pref is None:
+                    tiff_tile = not (sys.platform == "darwin" and (int(out_w) > 16000 or int(out_h) > 16000))
+                else:
+                    tiff_tile = bool(tiff_tile_pref)
+
+                predictor_pref = None
+                try:
+                    predictor_pref = s_in.get("tiff_predictor", None)
+                except Exception:
+                    predictor_pref = None
+                predictor = "horizontal"
+                if predictor_pref is not None:
+                    predictor = str(predictor_pref).strip().lower() or "horizontal"
+                if predictor not in {"none", "horizontal", "float"}:
+                    predictor = "horizontal"
+
+                save_kwargs: dict[str, object] = {
+                    "compression": str(tiff_compression or "none").strip().lower() or "none",
+                    "predictor": str(predictor),
+                    "tile": bool(tiff_tile),
+                }
+                if bool(tiff_tile):
+                    save_kwargs["tile_width"] = int(s_in.get("tiff_tile_width", 256) or 256)
+                    save_kwargs["tile_height"] = int(s_in.get("tiff_tile_height", 256) or 256)
+                    save_kwargs["tile_width"] = max(64, min(2048, int(save_kwargs["tile_width"])))
+                    save_kwargs["tile_height"] = max(64, min(2048, int(save_kwargs["tile_height"])))
+                if px_per_mm_target is not None and math.isfinite(float(px_per_mm_target)) and float(px_per_mm_target) > 0:
+                    save_kwargs["xres"] = float(px_per_mm_target)
+                    save_kwargs["yres"] = float(px_per_mm_target)
+                    save_kwargs["resunit"] = "inch"
+                    did_set = True
+                try:
+                    vimg.tiffsave(mosaic_path, **save_kwargs)
+                except Exception as exc:
+                    if is_no_space_error(exc):
+                        raise
+                    msg = str(exc).lower()
+                    if not any(k in msg for k in ("bigtiff", "big tiff", "too large", "4gb", "offset")):
+                        raise
+                    # Retry with BigTIFF only if needed. Many tools have better compatibility with classic TIFF.
+                    try:
+                        if os.path.exists(mosaic_path):
+                            os.remove(mosaic_path)
+                    except Exception:
+                        pass
+                    save_kwargs["bigtiff"] = True
+                    vimg.tiffsave(mosaic_path, **save_kwargs)
+            else:
+                imwrite(cv2, mosaic_path, pano, tiff_params)
+                if dpi_meta is not None and "dpi_x" in dpi_meta and "dpi_y" in dpi_meta:
+                    try:
+                        did_set = _try_set_dpi(
+                            mosaic_path, dpi_x=float(dpi_meta["dpi_x"]), dpi_y=float(dpi_meta["dpi_y"])  # type: ignore[arg-type]
+                        )
+                    except Exception:
+                        did_set = False
+
+            if dpi_meta is not None:
+                dpi_meta["set_in_file"] = bool(did_set)
         except Exception as exc:
             _write_err("final_write", exc)
             if is_no_space_error(exc):
@@ -860,10 +1558,48 @@ def stitch_scan_outputs(
                 ) from exc
             raise
 
+        if memmap_path is not None:
+            try:
+                del pano
+            except Exception:
+                pass
+            gc.collect()
+            try:
+                if os.path.exists(memmap_path):
+                    os.remove(memmap_path)
+            except Exception:
+                pass
+            memmap_path = None
+
+        # Always emit a JPEG preview for quick sanity-checking.
         try:
-            H, W = pano.shape[:2]
+            preview_max_dim = int(s_in.get("preview_max_dim", 2000))
         except Exception:
-            H, W = 0, 0
+            preview_max_dim = 2000
+        try:
+            preview_quality = int(s_in.get("preview_quality", 85))
+        except Exception:
+            preview_quality = 85
+        preview_max_dim = max(256, min(8000, int(preview_max_dim)))
+        preview_quality = max(30, min(95, int(preview_quality)))
+        try:
+            import pyvips  # type: ignore
+
+            img_prev = pyvips.Image.new_from_file(mosaic_path, access="sequential")
+            thumb = img_prev.thumbnail_image(int(preview_max_dim))
+            thumb_path = os.path.join(out_dir, f"mosaic_thumb_{preview_max_dim}.jpg")
+            thumb.write_to_file(thumb_path, Q=int(preview_quality))
+        except Exception:
+            pass
+
+        try:
+            max_px_meta = int(float(s_in.get("max_panorama_pixels", 2_000_000_000)))
+        except Exception:
+            max_px_meta = 2_000_000_000
+        try:
+            use_memmap_meta = bool(s_in.get("use_memmap", True))
+        except Exception:
+            use_memmap_meta = True
 
         meta: dict[str, object] = {
             "method": str(method_name),
@@ -877,6 +1613,8 @@ def stitch_scan_outputs(
                 "strategy": str(strategy_name),
                 "max_direct_tiles": int(max_direct_tiles),
                 "neighbor_match": str(neighbor_match),
+                "max_panorama_pixels": int(max_px_meta),
+                "use_memmap": bool(use_memmap_meta),
                 "final_megapix": float(stage1_final_megapix),
                 "stitcher": dict(base_stitcher_settings),
                 "orb_fast_threshold": orb_fast_threshold,
@@ -886,6 +1624,8 @@ def stitch_scan_outputs(
                 "opencv": str(getattr(cv2, "__version__", "?")),
             },
         }
+        if dpi_meta is not None:
+            meta["dpi"] = dict(dpi_meta)
         try:
             import stitching as stitching_pkg  # type: ignore
 
@@ -901,5 +1641,11 @@ def stitch_scan_outputs(
 
         _emit_progress(100.0, "Stitching: done.")
     except Exception as exc:
+        if memmap_path is not None:
+            try:
+                if os.path.exists(memmap_path):
+                    os.remove(memmap_path)
+            except Exception:
+                pass
         _write_err("stitch", exc)
         raise
