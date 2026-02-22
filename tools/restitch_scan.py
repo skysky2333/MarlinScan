@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         "--layout-blend",
         choices=["overwrite", "average", "feather"],
         default=None,
-        help="Compositing mode for layout stitching (default: overwrite).",
+        help="Compositing mode for layout stitching (default: feather).",
     )
     ap.add_argument(
         "--layout-feather-px",
@@ -176,6 +176,23 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Blend against already-placed neighbors within this grid radius in layout mode (default: 2).",
+    )
+    ap.add_argument(
+        "--no-layout-exposure",
+        action="store_true",
+        help="Disable per-tile exposure compensation (gain) in layout mode (default: enabled).",
+    )
+    ap.add_argument(
+        "--layout-gain-min",
+        type=float,
+        default=None,
+        help="Minimum per-tile exposure gain in layout mode (default: 0.7).",
+    )
+    ap.add_argument(
+        "--layout-gain-max",
+        type=float,
+        default=None,
+        help="Maximum per-tile exposure gain in layout mode (default: 1.4).",
     )
     ap.add_argument(
         "--no-layout-refine",
@@ -319,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
             stitch_settings["final_megapix"] = -1.0
             stitch_settings["layout_blend"] = "overwrite"
             stitch_settings["blender_type"] = "no"
+            stitch_settings["layout_exposure_compensate"] = False
         if bool(getattr(args, "no_memmap", False)):
             stitch_settings["use_memmap"] = False
         if args.dpi is not None:
@@ -353,6 +371,12 @@ def main(argv: list[str] | None = None) -> int:
             stitch_settings["layout_feather_px"] = int(args.layout_feather_px)
         if args.layout_blend_radius is not None:
             stitch_settings["layout_blend_radius"] = int(args.layout_blend_radius)
+        if bool(getattr(args, "no_layout_exposure", False)):
+            stitch_settings["layout_exposure_compensate"] = False
+        if args.layout_gain_min is not None:
+            stitch_settings["layout_gain_min"] = float(args.layout_gain_min)
+        if args.layout_gain_max is not None:
+            stitch_settings["layout_gain_max"] = float(args.layout_gain_max)
         if args.layout_seed is not None:
             stitch_settings["layout_seed"] = int(args.layout_seed)
         if bool(getattr(args, "no_layout_refine", False)):

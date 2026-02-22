@@ -1054,24 +1054,24 @@ def stitch_scan_outputs(
             w_final = max(1, int(round(float(tile_w) * float(scale_final))))
             h_final = max(1, int(round(float(tile_h) * float(scale_final))))
 
-            # Default feather to a substantial fraction of the tile size so seams fade out across
-            # large overlaps. Users can override with `layout_feather_px`.
-            feather_px = None
+            # Feather width:
+            # - If user provides `layout_feather_px`: use it (in final-resolution pixels).
+            # - Otherwise: derive later from the output canvas size and `blend_strength` (similar to OpenCV).
+            feather_px: int | None = None
             if feather_px_in is not None:
                 try:
                     feather_px = int(float(feather_px_in))
                 except Exception:
                     feather_px = None
-            if feather_px is None:
-                feather_px = int(round(0.4 * float(min(int(w_final), int(h_final)))))
-            feather_px = max(0, int(feather_px))
+            if feather_px is not None:
+                feather_px = max(0, int(feather_px))
 
             strategy_settings = {
                 "strategy": "layout",
                 "final_megapix": float(stage1_final_megapix),
                 **step_meta,
                 "blend": str(blend_mode),
-                "layout_feather_px": int(feather_px),
+                "blend_strength": float(s_in.get("blend_strength", 5.0)),
             }
 
             # Precompute per-row origins (supports row-parity-dependent steps for serpentine scans).
@@ -1104,6 +1104,7 @@ def stitch_scan_outputs(
                 refine_positions = True
 
             refined_by_rc: dict[tuple[int, int], tuple[float, float]] | None = None
+            refined_gains: list[float] | None = None
             refine_meta: dict[str, object] = {}
             if bool(refine_positions) and int(tile_count) >= 4 and int(nrows) >= 1 and int(ncols) >= 1:
                 _emit_progress(7.0, "Stitching: refining tile positions…")
@@ -1134,12 +1135,45 @@ def stitch_scan_outputs(
                 except Exception:
                     refine_max_edges = 0
 
+                try:
+                    exposure_comp = bool(s_in.get("layout_exposure_compensate", True))
+                except Exception:
+                    exposure_comp = True
+                try:
+                    gain_min = float(s_in.get("layout_gain_min", 0.7))
+                except Exception:
+                    gain_min = 0.7
+                try:
+                    gain_max = float(s_in.get("layout_gain_max", 1.4))
+                except Exception:
+                    gain_max = 1.4
+                try:
+                    gain_eps = float(s_in.get("layout_gain_eps", 1.0))
+                except Exception:
+                    gain_eps = 1.0
+                try:
+                    gain_prior_weight = float(s_in.get("layout_gain_prior_weight", 0.01))
+                except Exception:
+                    gain_prior_weight = 0.01
+                try:
+                    gain_stride = int(s_in.get("layout_gain_stride", 4))
+                except Exception:
+                    gain_stride = 4
+
                 refine_megapix = max(0.05, min(float(refine_megapix), float(orig_mp)))
                 refine_patch = max(128, min(1024, int(refine_patch)))
                 refine_resp_thresh = max(0.0, min(1.0, float(refine_resp_thresh)))
                 refine_max_correction_px = max(1.0, float(refine_max_correction_px))
                 refine_prior_weight = max(0.0, float(refine_prior_weight))
                 refine_max_edges = max(0, int(refine_max_edges))
+
+                gain_eps = max(0.0, float(gain_eps))
+                gain_prior_weight = max(0.0, float(gain_prior_weight))
+                gain_stride = max(1, min(16, int(gain_stride)))
+                if not (math.isfinite(float(gain_min)) and math.isfinite(float(gain_max))):
+                    gain_min, gain_max = 0.7, 1.4
+                gain_min = max(1e-3, float(gain_min))
+                gain_max = max(float(gain_min), float(gain_max))
 
                 scale_refine = float(_scale_for_mp(float(refine_megapix)))
                 if float(scale_refine) <= 1e-9:
@@ -1183,7 +1217,7 @@ def stitch_scan_outputs(
                     *,
                     dx_pred_final: float,
                     dy_pred_final: float,
-                ) -> tuple[float, float, float] | None:
+                ) -> tuple[tuple[float, float, float] | None, tuple[float, float] | None] | None:
                     img1u = _load_gray_ref(str(p1))
                     img2u = _load_gray_ref(str(p2))
                     if img1u is None or img2u is None:
@@ -1232,10 +1266,28 @@ def stitch_scan_outputs(
                     if p1u.size == 0 or p2u.size == 0:
                         return None
 
+                    gain_meas = None
+                    if bool(exposure_comp):
+                        try:
+                            p1s = p1u[:: int(gain_stride), :: int(gain_stride)]
+                            p2s = p2u[:: int(gain_stride), :: int(gain_stride)]
+                            m1 = float(p1s.mean())
+                            m2 = float(p2s.mean())
+                            ratio = (float(m1) + float(gain_eps)) / (float(m2) + float(gain_eps))
+                            if math.isfinite(float(ratio)) and float(ratio) > 0:
+                                dg = math.log(float(ratio))
+                                max_edge_ratio = max(1.01, float(gain_max) / max(1e-9, float(gain_min)))
+                                lo = -math.log(float(max_edge_ratio))
+                                hi = math.log(float(max_edge_ratio))
+                                dg = float(max(lo, min(hi, float(dg))))
+                                gain_meas = (float(dg), 0.2)
+                        except Exception:
+                            gain_meas = None
+
                     # Skip nearly-flat patches (phase correlation becomes unstable).
                     try:
                         if float(p1u.std()) < 6.0 or float(p2u.std()) < 6.0:
-                            return None
+                            return None, gain_meas
                     except Exception:
                         pass
 
@@ -1256,21 +1308,23 @@ def stitch_scan_outputs(
                     try:
                         (sx, sy), resp = cv2.phaseCorrelate(a, b)
                     except Exception:
-                        return None
+                        return None, gain_meas
                     if not math.isfinite(float(resp)) or float(resp) < float(refine_resp_thresh):
-                        return None
+                        return None, gain_meas
                     if not (math.isfinite(float(sx)) and math.isfinite(float(sy))):
-                        return None
+                        return None, gain_meas
 
                     corr_x = (-float(sx)) / float(factor)
                     corr_y = (-float(sy)) / float(factor)
                     if abs(float(corr_x)) > float(refine_max_correction_px) or abs(float(corr_y)) > float(refine_max_correction_px):
-                        return None
+                        return None, gain_meas
 
                     dx_meas = float(dx_pred_final) + float(corr_x)
                     dy_meas = float(dy_pred_final) + float(corr_y)
                     wgt = max(0.05, min(1.0, float(resp)))
-                    return float(dx_meas), float(dy_meas), float(wgt)
+                    if gain_meas is not None:
+                        gain_meas = (float(gain_meas[0]), float(wgt))
+                    return (float(dx_meas), float(dy_meas), float(wgt)), gain_meas
 
                 # Build edge list.
                 idx_by_rc: dict[tuple[int, int], int] = {(int(e.row), int(e.col)): int(i) for i, e in enumerate(entries)}
@@ -1286,6 +1340,17 @@ def stitch_scan_outputs(
                     ws.append(float(wgt))
                     dxs.append(float(dx))
                     dys.append(float(dy))
+
+                g_srcs: list[int] = []
+                g_dsts: list[int] = []
+                g_ws: list[float] = []
+                g_dgs: list[float] = []
+
+                def _add_gain_edge(i: int, j: int, dg: float, wgt: float) -> None:
+                    g_srcs.append(int(i))
+                    g_dsts.append(int(j))
+                    g_ws.append(float(wgt))
+                    g_dgs.append(float(dg))
 
                 # Candidate neighbor edges: right and down in the grid.
                 candidates: list[tuple[int, int, float, float]] = []
@@ -1313,14 +1378,24 @@ def stitch_scan_outputs(
                     candidates = candidates[: int(refine_max_edges)]
 
                 measured = 0
+                gain_measured = 0
                 for idx_edge, (i, j, dx_pred, dy_pred) in enumerate(candidates):
                     p1 = str(entries[int(i)].path)
                     p2 = str(entries[int(j)].path)
                     meas = _edge_measure(p1, p2, dx_pred_final=float(dx_pred), dy_pred_final=float(dy_pred))
                     if meas is not None:
-                        dx_m, dy_m, wgt = meas
-                        measured += 1
-                        _add_edge(int(i), int(j), float(dx_m), float(dy_m), float(wgt))
+                        pos_meas, gain_meas = meas
+                        if pos_meas is not None:
+                            dx_m, dy_m, wgt = pos_meas
+                            measured += 1
+                            _add_edge(int(i), int(j), float(dx_m), float(dy_m), float(wgt))
+                        else:
+                            # Keep a weak prior edge so the graph stays connected even through blank areas.
+                            _add_edge(int(i), int(j), float(dx_pred), float(dy_pred), 0.02)
+                        if gain_meas is not None:
+                            dg, wgt_g = gain_meas
+                            gain_measured += 1
+                            _add_gain_edge(int(i), int(j), float(dg), float(wgt_g))
                     else:
                         # Keep a weak prior edge so the graph stays connected even through blank areas.
                         _add_edge(int(i), int(j), float(dx_pred), float(dy_pred), 0.02)
@@ -1390,6 +1465,100 @@ def stitch_scan_outputs(
                 x_sol, itx, rx = _cg(bx, max_iter=500, tol=1e-3)
                 y_sol, ity, ry = _cg(by, max_iter=500, tol=1e-3)
 
+                gain_meta: dict[str, object] = {"enabled": bool(exposure_comp)}
+                if bool(exposure_comp) and g_srcs and g_dsts and g_dgs:
+                    try:
+                        g_src = np.asarray(g_srcs, dtype=np.int32)
+                        g_dst = np.asarray(g_dsts, dtype=np.int32)
+                        g_wts = np.asarray(g_ws, dtype=np.float64)
+                        dg_arr = np.asarray(g_dgs, dtype=np.float64)
+
+                        bg = np.bincount(g_src, -g_wts * dg_arr, minlength=int(n_nodes)) + np.bincount(
+                            g_dst, g_wts * dg_arr, minlength=int(n_nodes)
+                        )
+
+                        diag_g = (
+                            np.full(int(n_nodes), float(gain_prior_weight), dtype=np.float64)
+                            if float(gain_prior_weight) > 0
+                            else np.zeros(int(n_nodes), dtype=np.float64)
+                        )
+                        anchor_g = 0
+                        anchor_w_g = 1e6
+
+                        def _matvec_g(x: "np.ndarray") -> "np.ndarray":
+                            diff = g_wts * (x[g_src] - x[g_dst])
+                            y = np.bincount(g_src, diff, minlength=int(n_nodes)) + np.bincount(
+                                g_dst, -diff, minlength=int(n_nodes)
+                            )
+                            if diag_g is not None and float(gain_prior_weight) > 0:
+                                y = y + (diag_g * x)
+                            y[int(anchor_g)] += float(anchor_w_g) * float(x[int(anchor_g)])
+                            return y
+
+                        def _cg_g(
+                            b: "np.ndarray", *, max_iter: int = 400, tol: float = 1e-4
+                        ) -> tuple["np.ndarray", int, float]:
+                            x = np.zeros_like(b, dtype=np.float64)
+                            r = b - _matvec_g(x)
+                            p = r.copy()
+                            rs = float(np.dot(r, r))
+                            if not math.isfinite(float(rs)) or float(rs) <= 0:
+                                return x, 0, float(rs)
+                            for it in range(int(max_iter)):
+                                Ap = _matvec_g(p)
+                                denom = float(np.dot(p, Ap))
+                                if abs(float(denom)) <= 1e-12:
+                                    break
+                                a = float(rs) / float(denom)
+                                x = x + (a * p)
+                                r = r - (a * Ap)
+                                rs2 = float(np.dot(r, r))
+                                if math.sqrt(float(rs2)) <= float(tol):
+                                    rs = rs2
+                                    return x, int(it + 1), float(rs)
+                                p = r + ((rs2 / rs) * p)
+                                rs = rs2
+                            return x, int(max_iter), float(rs)
+
+                        xg_sol, itg, rg = _cg_g(bg, max_iter=500, tol=1e-4)
+                        try:
+                            xg_sol = xg_sol - float(np.median(xg_sol))
+                        except Exception:
+                            pass
+                        gains = np.exp(xg_sol)
+                        gains = np.clip(gains, float(gain_min), float(gain_max))
+                        refined_gains = [float(g) if math.isfinite(float(g)) else 1.0 for g in gains.tolist()]
+
+                        try:
+                            gmin0 = float(np.min(gains))
+                            gmax0 = float(np.max(gains))
+                            gmean0 = float(np.mean(gains))
+                            gstd0 = float(np.std(gains))
+                        except Exception:
+                            gmin0 = float(gain_min)
+                            gmax0 = float(gain_max)
+                            gmean0 = 1.0
+                            gstd0 = 0.0
+
+                        gain_meta = {
+                            "enabled": True,
+                            "gain_min": float(gain_min),
+                            "gain_max": float(gain_max),
+                            "gain_eps": float(gain_eps),
+                            "gain_prior_weight": float(gain_prior_weight),
+                            "gain_stride": int(gain_stride),
+                            "edges_total": int(len(candidates)),
+                            "edges_measured": int(gain_measured),
+                            "cg_iters": int(itg),
+                            "cg_resid": float(rg),
+                            "gain_result_min": float(gmin0),
+                            "gain_result_max": float(gmax0),
+                            "gain_result_mean": float(gmean0),
+                            "gain_result_std": float(gstd0),
+                        }
+                    except Exception as exc:
+                        gain_meta = {"enabled": False, "error": str(exc)}
+
                 refined_by_rc = {}
                 for e in entries:
                     i = idx_by_rc.get((int(e.row), int(e.col)))
@@ -1410,6 +1579,7 @@ def stitch_scan_outputs(
                     "cg_iters_y": int(ity),
                     "cg_resid_x": float(rx),
                     "cg_resid_y": float(ry),
+                    "exposure_comp": dict(gain_meta),
                 }
             else:
                 refine_meta = {"enabled": False}
@@ -1438,6 +1608,20 @@ def stitch_scan_outputs(
                     f"Affine layout would be too large ({out_w}x{out_h} px). "
                     "Lower final_megapix, scan a smaller area, or increase max_panorama_pixels (expect huge RAM/disk)."
                 )
+
+            if blend_mode == "feather":
+                feather_mode = "user" if feather_px is not None else "auto"
+                if feather_px is None:
+                    try:
+                        bs = float(s_in.get("blend_strength", 5.0))
+                    except Exception:
+                        bs = 5.0
+                    bs = max(0.0, float(bs))
+                    blend_width = (math.sqrt(float(out_w) * float(out_h)) * float(bs)) / 100.0
+                    feather_px = int(round(float(blend_width)))
+                feather_px = max(0, int(feather_px))
+                strategy_settings["layout_feather_px"] = int(feather_px)
+                strategy_settings["layout_feather_px_mode"] = str(feather_mode)
 
             strategy_settings["layout_refine_positions"] = dict(refine_meta)
             _emit_progress(10.0, f"Stitching: compositing {tile_count} tiles…")
@@ -1571,6 +1755,13 @@ def stitch_scan_outputs(
                         img = cv2.resize(img, (int(w_final), int(h_final)), interpolation=cv2.INTER_AREA)
                     except Exception:
                         continue
+                if refined_gains is not None and int(i) < int(len(refined_gains)):
+                    try:
+                        g = float(refined_gains[int(i)])
+                        if math.isfinite(float(g)) and abs(float(g) - 1.0) > 1e-3:
+                            img = cv2.convertScaleAbs(img, alpha=float(g))
+                    except Exception:
+                        pass
 
                 x, y = pos_by_rc.get((int(e.row), int(e.col)), (None, None))  # type: ignore[assignment]
                 if x is None or y is None:
@@ -1593,7 +1784,7 @@ def stitch_scan_outputs(
                     # Feather seams against already-placed tiles using a local overlap blend. We allow
                     # blending against more than just left/top neighbors because skewed scan lattices
                     # can produce large diagonal overlaps.
-                    fpx = max(0, min(int(feather_px), int(min(w_final, h_final) // 2)))
+                    fpx = max(0, int(feather_px))
 
                     x0 = int(x)
                     y0 = int(y)
