@@ -1006,11 +1006,11 @@ def stitch_scan_outputs(
             blend_mode = str(s_in.get("layout_blend", "feather")).strip().lower() or "feather"
             if blend_mode not in {"overwrite", "average", "feather"}:
                 blend_mode = "overwrite"
+            feather_px_in = None
             try:
-                feather_px = int(s_in.get("layout_feather_px", 200))
+                feather_px_in = s_in.get("layout_feather_px", None)
             except Exception:
-                feather_px = 200
-            feather_px = max(0, int(feather_px))
+                feather_px_in = None
 
             _emit_progress(5.0, "Stitching: estimating affine step vectors…")
             right_possible = int(nrows) * max(0, int(ncols) - 1)
@@ -1054,7 +1054,25 @@ def stitch_scan_outputs(
             w_final = max(1, int(round(float(tile_w) * float(scale_final))))
             h_final = max(1, int(round(float(tile_h) * float(scale_final))))
 
-            strategy_settings = {"strategy": "layout", "final_megapix": float(stage1_final_megapix), **step_meta, "blend": str(blend_mode)}
+            # Default feather to a substantial fraction of the tile size so seams fade out across
+            # large overlaps. Users can override with `layout_feather_px`.
+            feather_px = None
+            if feather_px_in is not None:
+                try:
+                    feather_px = int(float(feather_px_in))
+                except Exception:
+                    feather_px = None
+            if feather_px is None:
+                feather_px = int(round(0.4 * float(min(int(w_final), int(h_final)))))
+            feather_px = max(0, int(feather_px))
+
+            strategy_settings = {
+                "strategy": "layout",
+                "final_megapix": float(stage1_final_megapix),
+                **step_meta,
+                "blend": str(blend_mode),
+                "layout_feather_px": int(feather_px),
+            }
 
             # Precompute per-row origins (supports row-parity-dependent steps for serpentine scans).
             row_prefix: list[tuple[float, float]] = [(0.0, 0.0)]
@@ -1070,15 +1088,340 @@ def stitch_scan_outputs(
                 for rr in range(1, int(nrows)):
                     row_prefix.append((float(rr) * float(v_row[0]), float(rr) * float(v_row[1])))
 
+            # Initial positions from the global step vectors.
+            pos0_by_rc: dict[tuple[int, int], tuple[float, float]] = {}
+            for e in entries:
+                base_x, base_y = row_prefix[int(e.row)]
+                px = float(base_x) + (float(e.col) * float(v_col[0]))
+                py = float(base_y) + (float(e.col) * float(v_col[1]))
+                pos0_by_rc[(int(e.row), int(e.col))] = (float(px), float(py))
+
+            # Optional: refine positions using overlap-based phase correlation on neighbor pairs,
+            # then solve a globally-consistent pose graph (removes small motor step inaccuracies).
+            try:
+                refine_positions = bool(s_in.get("layout_refine_positions", True))
+            except Exception:
+                refine_positions = True
+
+            refined_by_rc: dict[tuple[int, int], tuple[float, float]] | None = None
+            refine_meta: dict[str, object] = {}
+            if bool(refine_positions) and int(tile_count) >= 4 and int(nrows) >= 1 and int(ncols) >= 1:
+                _emit_progress(7.0, "Stitching: refining tile positions…")
+                try:
+                    from functools import lru_cache
+
+                    refine_megapix = float(s_in.get("layout_refine_megapix", max(0.4, 2.0 * float(step_meta.get("layout_megapix", 0.2)))))  # type: ignore[arg-type]
+                except Exception:
+                    refine_megapix = 0.6
+                try:
+                    refine_patch = int(s_in.get("layout_refine_patch", 384))
+                except Exception:
+                    refine_patch = 384
+                try:
+                    refine_resp_thresh = float(s_in.get("layout_refine_resp_thresh", 0.15))
+                except Exception:
+                    refine_resp_thresh = 0.15
+                try:
+                    refine_max_correction_px = float(s_in.get("layout_refine_max_correction_px", 25.0))
+                except Exception:
+                    refine_max_correction_px = 25.0
+                try:
+                    refine_prior_weight = float(s_in.get("layout_refine_prior_weight", 0.01))
+                except Exception:
+                    refine_prior_weight = 0.01
+                try:
+                    refine_max_edges = int(s_in.get("layout_refine_max_edges", 0))
+                except Exception:
+                    refine_max_edges = 0
+
+                refine_megapix = max(0.05, min(float(refine_megapix), float(orig_mp)))
+                refine_patch = max(128, min(1024, int(refine_patch)))
+                refine_resp_thresh = max(0.0, min(1.0, float(refine_resp_thresh)))
+                refine_max_correction_px = max(1.0, float(refine_max_correction_px))
+                refine_prior_weight = max(0.0, float(refine_prior_weight))
+                refine_max_edges = max(0, int(refine_max_edges))
+
+                scale_refine = float(_scale_for_mp(float(refine_megapix)))
+                if float(scale_refine) <= 1e-9:
+                    scale_refine = float(scale_final)
+                factor = float(scale_refine) / float(scale_final) if float(scale_final) > 1e-9 else 1.0
+                if float(factor) <= 1e-9:
+                    factor = 1.0
+                w_ref = max(1, int(round(float(tile_w) * float(scale_refine))))
+                h_ref = max(1, int(round(float(tile_h) * float(scale_refine))))
+
+                @lru_cache(maxsize=256)
+                def _load_gray_ref(path: str) -> "np.ndarray | None":
+                    img0 = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+                    if img0 is None:
+                        return None
+                    if int(img0.shape[1]) != int(w_ref) or int(img0.shape[0]) != int(h_ref):
+                        try:
+                            img0 = cv2.resize(img0, (int(w_ref), int(h_ref)), interpolation=cv2.INTER_AREA)
+                        except Exception:
+                            return None
+                    return img0
+
+                win_cache: dict[int, "np.ndarray"] = {}
+
+                def _hann(sz: int) -> "np.ndarray | None":
+                    if int(sz) <= 0:
+                        return None
+                    cached = win_cache.get(int(sz))
+                    if cached is not None:
+                        return cached
+                    try:
+                        w2 = cv2.createHanningWindow((int(sz), int(sz)), cv2.CV_32F)
+                    except Exception:
+                        return None
+                    win_cache[int(sz)] = w2
+                    return w2
+
+                def _edge_measure(
+                    p1: str,
+                    p2: str,
+                    *,
+                    dx_pred_final: float,
+                    dy_pred_final: float,
+                ) -> tuple[float, float, float] | None:
+                    img1u = _load_gray_ref(str(p1))
+                    img2u = _load_gray_ref(str(p2))
+                    if img1u is None or img2u is None:
+                        return None
+                    dx_pred = float(dx_pred_final) * float(factor)
+                    dy_pred = float(dy_pred_final) * float(factor)
+
+                    w0 = int(img1u.shape[1])
+                    h0 = int(img1u.shape[0])
+
+                    if dx_pred >= 0:
+                        ox0 = int(round(dx_pred))
+                        ox1 = int(w0)
+                    else:
+                        ox0 = 0
+                        ox1 = int(w0 + int(round(dx_pred)))
+                    if dy_pred >= 0:
+                        oy0 = int(round(dy_pred))
+                        oy1 = int(h0)
+                    else:
+                        oy0 = 0
+                        oy1 = int(h0 + int(round(dy_pred)))
+                    ox1 = max(int(ox0), min(int(w0), int(ox1)))
+                    oy1 = max(int(oy0), min(int(h0), int(oy1)))
+                    ow = int(ox1 - ox0)
+                    oh = int(oy1 - oy0)
+                    if int(ow) < 64 or int(oh) < 64:
+                        return None
+
+                    psz = int(min(int(refine_patch), int(ow), int(oh)))
+                    if int(psz) < 128:
+                        return None
+
+                    cx = int(ox0 + (ow // 2) - (psz // 2))
+                    cy = int(oy0 + (oh // 2) - (psz // 2))
+                    cx = max(0, min(int(w0 - psz), int(cx)))
+                    cy = max(0, min(int(h0 - psz), int(cy)))
+
+                    x2 = int(round(float(cx) - float(dx_pred)))
+                    y2 = int(round(float(cy) - float(dy_pred)))
+                    if x2 < 0 or y2 < 0 or (x2 + int(psz)) > int(img2u.shape[1]) or (y2 + int(psz)) > int(img2u.shape[0]):
+                        return None
+
+                    p1u = img1u[int(cy) : int(cy + psz), int(cx) : int(cx + psz)]
+                    p2u = img2u[int(y2) : int(y2 + psz), int(x2) : int(x2 + psz)]
+                    if p1u.size == 0 or p2u.size == 0:
+                        return None
+
+                    # Skip nearly-flat patches (phase correlation becomes unstable).
+                    try:
+                        if float(p1u.std()) < 6.0 or float(p2u.std()) < 6.0:
+                            return None
+                    except Exception:
+                        pass
+
+                    a = p1u.astype(np.float32)
+                    b = p2u.astype(np.float32)
+                    try:
+                        a = a - float(a.mean())
+                        b = b - float(b.mean())
+                    except Exception:
+                        pass
+                    w2 = _hann(int(psz))
+                    if w2 is not None:
+                        try:
+                            a = a * w2
+                            b = b * w2
+                        except Exception:
+                            pass
+                    try:
+                        (sx, sy), resp = cv2.phaseCorrelate(a, b)
+                    except Exception:
+                        return None
+                    if not math.isfinite(float(resp)) or float(resp) < float(refine_resp_thresh):
+                        return None
+                    if not (math.isfinite(float(sx)) and math.isfinite(float(sy))):
+                        return None
+
+                    corr_x = (-float(sx)) / float(factor)
+                    corr_y = (-float(sy)) / float(factor)
+                    if abs(float(corr_x)) > float(refine_max_correction_px) or abs(float(corr_y)) > float(refine_max_correction_px):
+                        return None
+
+                    dx_meas = float(dx_pred_final) + float(corr_x)
+                    dy_meas = float(dy_pred_final) + float(corr_y)
+                    wgt = max(0.05, min(1.0, float(resp)))
+                    return float(dx_meas), float(dy_meas), float(wgt)
+
+                # Build edge list.
+                idx_by_rc: dict[tuple[int, int], int] = {(int(e.row), int(e.col)): int(i) for i, e in enumerate(entries)}
+                srcs: list[int] = []
+                dsts: list[int] = []
+                ws: list[float] = []
+                dxs: list[float] = []
+                dys: list[float] = []
+
+                def _add_edge(i: int, j: int, dx: float, dy: float, wgt: float) -> None:
+                    srcs.append(int(i))
+                    dsts.append(int(j))
+                    ws.append(float(wgt))
+                    dxs.append(float(dx))
+                    dys.append(float(dy))
+
+                # Candidate neighbor edges: right and down in the grid.
+                candidates: list[tuple[int, int, float, float]] = []
+                for e in entries:
+                    r = int(e.row)
+                    c = int(e.col)
+                    i = idx_by_rc.get((int(r), int(c)))
+                    if i is None:
+                        continue
+                    j = idx_by_rc.get((int(r), int(c + 1)))
+                    if j is not None:
+                        candidates.append((int(i), int(j), float(v_col[0]), float(v_col[1])))
+                    k = idx_by_rc.get((int(r + 1), int(c)))
+                    if k is not None:
+                        stepv = v_row
+                        if v_row_even is not None and v_row_odd is not None:
+                            stepv = v_row_even if (int(r) % 2) == 0 else v_row_odd
+                        candidates.append((int(i), int(k), float(stepv[0]), float(stepv[1])))
+
+                if int(refine_max_edges) > 0 and int(len(candidates)) > int(refine_max_edges):
+                    import random
+
+                    rng = random.Random(int(s_in.get("layout_seed", 0)))
+                    rng.shuffle(candidates)
+                    candidates = candidates[: int(refine_max_edges)]
+
+                measured = 0
+                for idx_edge, (i, j, dx_pred, dy_pred) in enumerate(candidates):
+                    p1 = str(entries[int(i)].path)
+                    p2 = str(entries[int(j)].path)
+                    meas = _edge_measure(p1, p2, dx_pred_final=float(dx_pred), dy_pred_final=float(dy_pred))
+                    if meas is not None:
+                        dx_m, dy_m, wgt = meas
+                        measured += 1
+                        _add_edge(int(i), int(j), float(dx_m), float(dy_m), float(wgt))
+                    else:
+                        # Keep a weak prior edge so the graph stays connected even through blank areas.
+                        _add_edge(int(i), int(j), float(dx_pred), float(dy_pred), 0.02)
+                    if (idx_edge % 200) == 0 and (idx_edge + 1) < int(len(candidates)):
+                        frac = float(idx_edge + 1) / float(max(1, int(len(candidates))))
+                        _emit_progress(7.0 + (2.0 * frac), f"Stitching: refining positions ({idx_edge + 1}/{len(candidates)})…")
+
+                n_nodes = int(len(entries))
+                src = np.asarray(srcs, dtype=np.int32)
+                dst = np.asarray(dsts, dtype=np.int32)
+                wts = np.asarray(ws, dtype=np.float64)
+                dx_arr = np.asarray(dxs, dtype=np.float64)
+                dy_arr = np.asarray(dys, dtype=np.float64)
+
+                # Right-hand sides.
+                bx = np.bincount(src, -wts * dx_arr, minlength=int(n_nodes)) + np.bincount(dst, wts * dx_arr, minlength=int(n_nodes))
+                by = np.bincount(src, -wts * dy_arr, minlength=int(n_nodes)) + np.bincount(dst, wts * dy_arr, minlength=int(n_nodes))
+
+                # Soft prior to the initial grid positions to prevent drift in low-feature regions.
+                prior_x = np.zeros(int(n_nodes), dtype=np.float64)
+                prior_y = np.zeros(int(n_nodes), dtype=np.float64)
+                for e in entries:
+                    i = idx_by_rc.get((int(e.row), int(e.col)))
+                    if i is None:
+                        continue
+                    px0, py0 = pos0_by_rc[(int(e.row), int(e.col))]
+                    prior_x[int(i)] = float(px0)
+                    prior_y[int(i)] = float(py0)
+                diag = np.full(int(n_nodes), float(refine_prior_weight), dtype=np.float64) if float(refine_prior_weight) > 0 else np.zeros(int(n_nodes), dtype=np.float64)
+                bx = bx + (diag * prior_x)
+                by = by + (diag * prior_y)
+
+                anchor = 0
+                anchor_w = 1e6
+
+                def _matvec(x: "np.ndarray") -> "np.ndarray":
+                    diff = wts * (x[src] - x[dst])
+                    y = np.bincount(src, diff, minlength=int(n_nodes)) + np.bincount(dst, -diff, minlength=int(n_nodes))
+                    if diag is not None and float(refine_prior_weight) > 0:
+                        y = y + (diag * x)
+                    y[int(anchor)] += float(anchor_w) * float(x[int(anchor)])
+                    return y
+
+                def _cg(b: "np.ndarray", *, max_iter: int = 400, tol: float = 1e-4) -> tuple["np.ndarray", int, float]:
+                    x = np.zeros_like(b, dtype=np.float64)
+                    r = b - _matvec(x)
+                    p = r.copy()
+                    rs = float(np.dot(r, r))
+                    if not math.isfinite(float(rs)) or float(rs) <= 0:
+                        return x, 0, float(rs)
+                    for it in range(int(max_iter)):
+                        Ap = _matvec(p)
+                        denom = float(np.dot(p, Ap))
+                        if abs(float(denom)) <= 1e-12:
+                            break
+                        a = float(rs) / float(denom)
+                        x = x + (a * p)
+                        r = r - (a * Ap)
+                        rs2 = float(np.dot(r, r))
+                        if math.sqrt(float(rs2)) <= float(tol):
+                            rs = rs2
+                            return x, int(it + 1), float(rs)
+                        p = r + ((rs2 / rs) * p)
+                        rs = rs2
+                    return x, int(max_iter), float(rs)
+
+                x_sol, itx, rx = _cg(bx, max_iter=500, tol=1e-3)
+                y_sol, ity, ry = _cg(by, max_iter=500, tol=1e-3)
+
+                refined_by_rc = {}
+                for e in entries:
+                    i = idx_by_rc.get((int(e.row), int(e.col)))
+                    if i is None:
+                        continue
+                    refined_by_rc[(int(e.row), int(e.col))] = (float(x_sol[int(i)]), float(y_sol[int(i)]))
+
+                refine_meta = {
+                    "enabled": True,
+                    "refine_megapix": float(refine_megapix),
+                    "refine_patch": int(refine_patch),
+                    "refine_resp_thresh": float(refine_resp_thresh),
+                    "refine_max_correction_px": float(refine_max_correction_px),
+                    "refine_prior_weight": float(refine_prior_weight),
+                    "edges_total": int(len(candidates)),
+                    "edges_measured": int(measured),
+                    "cg_iters_x": int(itx),
+                    "cg_iters_y": int(ity),
+                    "cg_resid_x": float(rx),
+                    "cg_resid_y": float(ry),
+                }
+            else:
+                refine_meta = {"enabled": False}
+
+            pos_by_rc_f: dict[tuple[int, int], tuple[float, float]] = refined_by_rc if refined_by_rc is not None else pos0_by_rc
+
             # Compute output bounds.
             min_x = float("inf")
             min_y = float("inf")
             max_x = float("-inf")
             max_y = float("-inf")
-            for e in entries:
-                base_x, base_y = row_prefix[int(e.row)]
-                px = float(base_x) + (float(e.col) * float(v_col[0]))
-                py = float(base_y) + (float(e.col) * float(v_col[1]))
+            for _rc, (px, py) in pos_by_rc_f.items():
                 min_x = min(min_x, float(px))
                 min_y = min(min_y, float(py))
                 max_x = max(max_x, float(px))
@@ -1096,6 +1439,7 @@ def stitch_scan_outputs(
                     "Lower final_megapix, scan a smaller area, or increase max_panorama_pixels (expect huge RAM/disk)."
                 )
 
+            strategy_settings["layout_refine_positions"] = dict(refine_meta)
             _emit_progress(10.0, f"Stitching: compositing {tile_count} tiles…")
             try:
                 pano_bytes = int(area) * 3
@@ -1136,35 +1480,12 @@ def stitch_scan_outputs(
 
             pos_by_rc: dict[tuple[int, int], tuple[int, int]] = {}
             for e in entries:
-                base_x, base_y = row_prefix[int(e.row)]
-                px = float(base_x) + (float(e.col) * float(v_col[0]))
-                py = float(base_y) + (float(e.col) * float(v_col[1]))
+                px, py = pos_by_rc_f.get((int(e.row), int(e.col)), (None, None))  # type: ignore[assignment]
+                if px is None or py is None:
+                    continue
                 x = int(round(float(px) - float(min_x)))
                 y = int(round(float(py) - float(min_y)))
                 pos_by_rc[(int(e.row), int(e.col))] = (int(x), int(y))
-
-            def _rect_subtract(
-                rect: tuple[int, int, int, int],
-                cut: tuple[int, int, int, int],
-            ) -> list[tuple[int, int, int, int]]:
-                rx0, ry0, rx1, ry1 = rect
-                cx0, cy0, cx1, cy1 = cut
-                ix0 = max(int(rx0), int(cx0))
-                iy0 = max(int(ry0), int(cy0))
-                ix1 = min(int(rx1), int(cx1))
-                iy1 = min(int(ry1), int(cy1))
-                if ix1 <= ix0 or iy1 <= iy0:
-                    return [rect]
-                out: list[tuple[int, int, int, int]] = []
-                if iy0 > ry0:
-                    out.append((int(rx0), int(ry0), int(rx1), int(iy0)))
-                if iy1 < ry1:
-                    out.append((int(rx0), int(iy1), int(rx1), int(ry1)))
-                if ix0 > rx0:
-                    out.append((int(rx0), int(iy0), int(ix0), int(iy1)))
-                if ix1 < rx1:
-                    out.append((int(ix1), int(iy0), int(rx1), int(iy1)))
-                return out
 
             def _feather_overlap_inplace(
                 *,
@@ -1234,6 +1555,13 @@ def stitch_scan_outputs(
                     out = (old_band * (1.0 - a2)) + (new_band * a2)
                     pano_view[int(blend0) : int(blend1), :] = np.clip(out, 0, 255).astype(np.uint8)
 
+            try:
+                layout_blend_radius = int(s_in.get("layout_blend_radius", 2))
+            except Exception:
+                layout_blend_radius = 2
+            layout_blend_radius = max(1, min(4, int(layout_blend_radius)))
+            strategy_settings["layout_blend_radius"] = int(layout_blend_radius)
+
             for i, e in enumerate(entries):
                 img = cv2.imread(str(e.path), cv2.IMREAD_COLOR)
                 if img is None:
@@ -1262,7 +1590,9 @@ def stitch_scan_outputs(
                     except Exception:
                         pano[int(y) : int(y + h_final), int(x) : int(x + w_final)] = img
                 elif blend_mode == "feather":
-                    # Feather seams against already-placed neighbors without overwriting neighbor pixels first.
+                    # Feather seams against already-placed tiles using a local overlap blend. We allow
+                    # blending against more than just left/top neighbors because skewed scan lattices
+                    # can produce large diagonal overlaps.
                     fpx = max(0, min(int(feather_px), int(min(w_final, h_final) // 2)))
 
                     x0 = int(x)
@@ -1270,69 +1600,50 @@ def stitch_scan_outputs(
                     x1 = int(x + w_final)
                     y1 = int(y + h_final)
 
-                    overlaps: list[tuple[tuple[int, int, int, int], tuple[int, int]]] = []
-                    left_xy = pos_by_rc.get((int(e.row), int(e.col) - 1))
-                    if left_xy is not None:
-                        lx, ly = left_xy
-                        ox0 = max(int(x0), int(lx))
-                        oy0 = max(int(y0), int(ly))
-                        ox1 = min(int(x1), int(lx + w_final))
-                        oy1 = min(int(y1), int(ly + h_final))
-                        if ox1 > ox0 and oy1 > oy0:
-                            overlaps.append(((int(ox0), int(oy0), int(ox1), int(oy1)), (int(x0 - lx), int(y0 - ly))))
-
-                    top_xy = pos_by_rc.get((int(e.row) - 1, int(e.col)))
-                    if top_xy is not None:
-                        tx, ty = top_xy
-                        ox0 = max(int(x0), int(tx))
-                        oy0 = max(int(y0), int(ty))
-                        ox1 = min(int(x1), int(tx + w_final))
-                        oy1 = min(int(y1), int(ty + h_final))
-                        if ox1 > ox0 and oy1 > oy0:
-                            overlaps.append(((int(ox0), int(oy0), int(ox1), int(oy1)), (int(x0 - tx), int(y0 - ty))))
-
-                    # Write only non-overlap regions first.
-                    rects: list[tuple[int, int, int, int]] = [(int(x0), int(y0), int(x1), int(y1))]
-                    for (ox0, oy0, ox1, oy1), _dxy in overlaps:
-                        new_rects: list[tuple[int, int, int, int]] = []
-                        for r0 in rects:
-                            new_rects.extend(_rect_subtract(r0, (int(ox0), int(oy0), int(ox1), int(oy1))))
-                        rects = new_rects
-
-                    for rx0, ry0, rx1, ry1 in rects:
-                        if rx1 <= rx0 or ry1 <= ry0:
-                            continue
-                        pano[int(ry0) : int(ry1), int(rx0) : int(rx1)] = img[
-                            int(ry0 - y0) : int(ry1 - y0), int(rx0 - x0) : int(rx1 - x0)
-                        ]
-
-                    # Blend overlaps (if any); otherwise just write the tile.
-                    if not overlaps:
+                    # First, fill any still-empty pixels (non-overlap) directly.
+                    roi0 = pano[int(y0) : int(y1), int(x0) : int(x1)]
+                    try:
+                        empty = (roi0.sum(axis=2) == 0)  # type: ignore[call-arg]
+                        if empty.any():
+                            roi0[empty] = img[empty]
+                    except Exception:
                         pano[int(y0) : int(y1), int(x0) : int(x1)] = img
-                    elif int(fpx) <= 0:
-                        # No feather band requested; choose the existing pano (neighbor) in overlap.
-                        # Fill the overlap region with the new tile where pano is still empty.
-                        for (ox0, oy0, ox1, oy1), _dxy in overlaps:
-                            roi = pano[int(oy0) : int(oy1), int(ox0) : int(ox1)]
-                            try:
-                                mask = (roi.sum(axis=2) == 0)  # type: ignore[call-arg]
-                                if mask.any():
-                                    roi[mask] = img[int(oy0 - y0) : int(oy1 - y0), int(ox0 - x0) : int(ox1 - x0)][
-                                        mask
-                                    ]
-                            except Exception:
-                                pass
-                    else:
-                        for (ox0, oy0, ox1, oy1), (dx, dy) in overlaps:
-                            pano_view = pano[int(oy0) : int(oy1), int(ox0) : int(ox1)]
-                            new_view = img[int(oy0 - y0) : int(oy1 - y0), int(ox0 - x0) : int(ox1 - x0)]
-                            _feather_overlap_inplace(
-                                pano_view=pano_view,
-                                new_view=new_view,
-                                dx=int(dx),
-                                dy=int(dy),
-                                feather=int(fpx),
-                            )
+                        empty = None  # type: ignore[assignment]
+
+                    # Then blend overlaps against already-placed neighbors within a small radius.
+                    if int(fpx) > 0:
+                        r0 = int(e.row)
+                        c0 = int(e.col)
+                        for dr in range(-int(layout_blend_radius), 1):
+                            for dc in range(-int(layout_blend_radius), int(layout_blend_radius) + 1):
+                                if int(dr) == 0 and int(dc) >= 0:
+                                    continue
+                                if int(dr) == 0 and int(dc) == 0:
+                                    continue
+                                nb = pos_by_rc.get((int(r0 + dr), int(c0 + dc)))
+                                if nb is None:
+                                    continue
+                                nb_x, nb_y = nb
+                                ox0 = max(int(x0), int(nb_x))
+                                oy0 = max(int(y0), int(nb_y))
+                                ox1 = min(int(x1), int(nb_x + w_final))
+                                oy1 = min(int(y1), int(nb_y + h_final))
+                                if ox1 <= ox0 or oy1 <= oy0:
+                                    continue
+                                pano_view = pano[int(oy0) : int(oy1), int(ox0) : int(ox1)]
+                                try:
+                                    if (pano_view.sum(axis=2) == 0).all():  # type: ignore[call-arg]
+                                        continue
+                                except Exception:
+                                    pass
+                                new_view = img[int(oy0 - y0) : int(oy1 - y0), int(ox0 - x0) : int(ox1 - x0)]
+                                _feather_overlap_inplace(
+                                    pano_view=pano_view,
+                                    new_view=new_view,
+                                    dx=int(x0 - nb_x),
+                                    dy=int(y0 - nb_y),
+                                    feather=int(fpx),
+                                )
                 else:
                     pano[int(y) : int(y + h_final), int(x) : int(x + w_final)] = img
 

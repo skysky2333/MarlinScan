@@ -169,7 +169,54 @@ def main(argv: list[str] | None = None) -> int:
         "--layout-feather-px",
         type=int,
         default=None,
-        help="Feather width in px (final resolution) for --layout-blend feather (default: 200).",
+        help="Feather width in px (final resolution) for --layout-blend feather (default: auto).",
+    )
+    ap.add_argument(
+        "--layout-blend-radius",
+        type=int,
+        default=None,
+        help="Blend against already-placed neighbors within this grid radius in layout mode (default: 2).",
+    )
+    ap.add_argument(
+        "--no-layout-refine",
+        action="store_true",
+        help="Disable local position refinement in layout mode (faster, but more visible seams/misalignment).",
+    )
+    ap.add_argument(
+        "--layout-refine-megapix",
+        type=float,
+        default=None,
+        help="Megapix used for layout position refinement (default: auto).",
+    )
+    ap.add_argument(
+        "--layout-refine-patch",
+        type=int,
+        default=None,
+        help="Patch size (px, refine resolution) for phase correlation during layout refinement (default: 384).",
+    )
+    ap.add_argument(
+        "--layout-refine-resp-thresh",
+        type=float,
+        default=None,
+        help="Min phase correlation response to accept an edge during refinement (default: 0.15).",
+    )
+    ap.add_argument(
+        "--layout-refine-max-correction-px",
+        type=float,
+        default=None,
+        help="Max per-edge correction (px at final resolution) during refinement (default: 25).",
+    )
+    ap.add_argument(
+        "--layout-refine-prior-weight",
+        type=float,
+        default=None,
+        help="Soft prior weight towards the initial grid positions (default: 0.01).",
+    )
+    ap.add_argument(
+        "--layout-refine-max-edges",
+        type=int,
+        default=None,
+        help="Limit number of refined edges (0 = all; default: 0).",
     )
     ap.add_argument(
         "--layout-seed",
@@ -304,8 +351,24 @@ def main(argv: list[str] | None = None) -> int:
             stitch_settings["layout_blend"] = str(args.layout_blend)
         if args.layout_feather_px is not None:
             stitch_settings["layout_feather_px"] = int(args.layout_feather_px)
+        if args.layout_blend_radius is not None:
+            stitch_settings["layout_blend_radius"] = int(args.layout_blend_radius)
         if args.layout_seed is not None:
             stitch_settings["layout_seed"] = int(args.layout_seed)
+        if bool(getattr(args, "no_layout_refine", False)):
+            stitch_settings["layout_refine_positions"] = False
+        if args.layout_refine_megapix is not None:
+            stitch_settings["layout_refine_megapix"] = float(args.layout_refine_megapix)
+        if args.layout_refine_patch is not None:
+            stitch_settings["layout_refine_patch"] = int(args.layout_refine_patch)
+        if args.layout_refine_resp_thresh is not None:
+            stitch_settings["layout_refine_resp_thresh"] = float(args.layout_refine_resp_thresh)
+        if args.layout_refine_max_correction_px is not None:
+            stitch_settings["layout_refine_max_correction_px"] = float(args.layout_refine_max_correction_px)
+        if args.layout_refine_prior_weight is not None:
+            stitch_settings["layout_refine_prior_weight"] = float(args.layout_refine_prior_weight)
+        if args.layout_refine_max_edges is not None:
+            stitch_settings["layout_refine_max_edges"] = int(args.layout_refine_max_edges)
         if args.blender_type is not None:
             stitch_settings["blender_type"] = str(args.blender_type)
         if args.blend_strength is not None:
