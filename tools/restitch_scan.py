@@ -186,13 +186,24 @@ def main(argv: list[str] | None = None) -> int:
         "--layout-gain-min",
         type=float,
         default=None,
-        help="Minimum per-tile exposure gain in layout mode (default: 0.7).",
+        help="Minimum per-tile exposure gain in layout mode (default: 0.5).",
     )
     ap.add_argument(
         "--layout-gain-max",
         type=float,
         default=None,
-        help="Maximum per-tile exposure gain in layout mode (default: 1.4).",
+        help="Maximum per-tile exposure gain in layout mode (default: 2.0).",
+    )
+    ap.add_argument(
+        "--no-layout-black-transparent",
+        action="store_true",
+        help="Disable treating pure-black tile borders as transparent (default: enabled).",
+    )
+    ap.add_argument(
+        "--layout-black-threshold",
+        type=int,
+        default=None,
+        help="Threshold (0–32) for detecting black borders to treat as transparent (default: 2).",
     )
     ap.add_argument(
         "--no-layout-refine",
@@ -377,6 +388,10 @@ def main(argv: list[str] | None = None) -> int:
             stitch_settings["layout_gain_min"] = float(args.layout_gain_min)
         if args.layout_gain_max is not None:
             stitch_settings["layout_gain_max"] = float(args.layout_gain_max)
+        if bool(getattr(args, "no_layout_black_transparent", False)):
+            stitch_settings["layout_black_transparent"] = False
+        if args.layout_black_threshold is not None:
+            stitch_settings["layout_black_threshold"] = int(args.layout_black_threshold)
         if args.layout_seed is not None:
             stitch_settings["layout_seed"] = int(args.layout_seed)
         if bool(getattr(args, "no_layout_refine", False)):

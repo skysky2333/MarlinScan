@@ -146,6 +146,7 @@ def stitch_scan_outputs(
             "stitch_meta.json",
             "mosaic_full.tif",
             "_mosaic_memmap.dat",
+            "_mosaic_weights.dat",
             "mosaic_thumb_2000.jpg",
         ):
             p = os.path.join(out_dir, fn)
@@ -983,6 +984,8 @@ def stitch_scan_outputs(
     strategy_settings: dict[str, object] = {}
     method_name = "openstitching-affine"
     memmap_path: str | None = None
+    weights_memmap_path: str | None = None
+    weights = None
     try:
         force_layout = bool(s_in.get("force_layout", False)) or (float(stage1_final_megapix) == -1.0)
         use_layout = bool(force_layout) or (int(tile_count) > int(max_direct_tiles))
@@ -1140,13 +1143,13 @@ def stitch_scan_outputs(
                 except Exception:
                     exposure_comp = True
                 try:
-                    gain_min = float(s_in.get("layout_gain_min", 0.7))
+                    gain_min = float(s_in.get("layout_gain_min", 0.5))
                 except Exception:
-                    gain_min = 0.7
+                    gain_min = 0.5
                 try:
-                    gain_max = float(s_in.get("layout_gain_max", 1.4))
+                    gain_max = float(s_in.get("layout_gain_max", 2.0))
                 except Exception:
-                    gain_max = 1.4
+                    gain_max = 2.0
                 try:
                     gain_eps = float(s_in.get("layout_gain_eps", 1.0))
                 except Exception:
@@ -1671,6 +1674,55 @@ def stitch_scan_outputs(
                 y = int(round(float(py) - float(min_y)))
                 pos_by_rc[(int(e.row), int(e.col))] = (int(x), int(y))
 
+            # Some tiles contain a pure-black border region (camera framing / small pose adjustments).
+            # Exclude it by only compositing the bounding box of "non-black" pixels, so black doesn't
+            # overwrite valid neighboring data.
+            try:
+                black_transparent = bool(s_in.get("layout_black_transparent", True))
+            except Exception:
+                black_transparent = True
+            try:
+                black_threshold = int(s_in.get("layout_black_threshold", 2))
+            except Exception:
+                black_threshold = 2
+            black_threshold = max(0, min(32, int(black_threshold)))
+            strategy_settings["layout_black_transparent"] = bool(black_transparent)
+            strategy_settings["layout_black_threshold"] = int(black_threshold)
+
+            if blend_mode == "feather":
+                strategy_settings["layout_blend_impl"] = "weighted_feather"
+                weights = None
+                try:
+                    weights_bytes = int(area) * 2
+                except Exception:
+                    weights_bytes = 0
+                if memmap_path is not None:
+                    weights_memmap_path = os.path.join(out_dir, "_mosaic_weights.dat")
+                    try:
+                        if os.path.exists(weights_memmap_path):
+                            os.remove(weights_memmap_path)
+                    except Exception:
+                        pass
+                    _emit_progress(
+                        9.2, f"Stitching: allocating blend weights (~{weights_bytes / (1024**3):.1f} GiB)…"
+                    )
+                    try:
+                        weights = np.memmap(
+                            weights_memmap_path, dtype=np.uint16, mode="w+", shape=(int(out_h), int(out_w))
+                        )
+                    except Exception as exc:
+                        _write_err("weights_alloc", exc)
+                        if is_no_space_error(exc):
+                            raise RuntimeError(
+                                "No space left on device while allocating the blend weight map for full-res stitching. "
+                                "Free disk space, choose a different output folder, or disable feather blending."
+                            ) from exc
+                        raise RuntimeError(
+                            f"Failed to allocate blend weight map: {exc} (path: {weights_memmap_path})"
+                        ) from exc
+                else:
+                    weights = np.zeros((int(out_h), int(out_w)), dtype=np.uint16)
+
             def _feather_overlap_inplace(
                 *,
                 pano_view: "np.ndarray",
@@ -1769,74 +1821,88 @@ def stitch_scan_outputs(
                 if x < 0 or y < 0 or (x + int(w_final)) > int(out_w) or (y + int(h_final)) > int(out_h):
                     continue
 
+                # Determine the non-black bounding box within the tile so pure-black borders don't
+                # overwrite valid neighboring pixels.
+                bx0 = 0
+                by0 = 0
+                bx1 = int(w_final) - 1
+                by1 = int(h_final) - 1
+                if bool(black_transparent) and int(black_threshold) > 0:
+                    thr = int(black_threshold)
+                    try:
+                        while by0 <= by1 and not (img[int(by0)] > thr).any():  # type: ignore[call-arg]
+                            by0 += 1
+                        while by1 >= by0 and not (img[int(by1)] > thr).any():  # type: ignore[call-arg]
+                            by1 -= 1
+                        while bx0 <= bx1 and not (img[int(by0) : int(by1 + 1), int(bx0)] > thr).any():  # type: ignore[call-arg]
+                            bx0 += 1
+                        while bx1 >= bx0 and not (img[int(by0) : int(by1 + 1), int(bx1)] > thr).any():  # type: ignore[call-arg]
+                            bx1 -= 1
+                        if bx0 > bx1 or by0 > by1:
+                            bx0, by0, bx1, by1 = 0, 0, int(w_final) - 1, int(h_final) - 1
+                    except Exception:
+                        bx0, by0, bx1, by1 = 0, 0, int(w_final) - 1, int(h_final) - 1
+
+                ax0 = int(x) + int(bx0)
+                ay0 = int(y) + int(by0)
+                ax1 = int(x) + int(bx1) + 1
+                ay1 = int(y) + int(by1) + 1
+                if ax1 <= ax0 or ay1 <= ay0:
+                    continue
+
                 if blend_mode == "average":
-                    roi = pano[int(y) : int(y + h_final), int(x) : int(x + w_final)]
+                    roi = pano[int(ay0) : int(ay1), int(ax0) : int(ax1)]
+                    img_roi = img[int(by0) : int(by1 + 1), int(bx0) : int(bx1 + 1)]
                     try:
                         mask = (roi.sum(axis=2) > 0)  # type: ignore[call-arg]
                         if mask.any():
-                            roi[mask] = ((roi[mask].astype(np.uint16) + img[mask].astype(np.uint16)) // 2).astype(
+                            roi[mask] = ((roi[mask].astype(np.uint16) + img_roi[mask].astype(np.uint16)) // 2).astype(
                                 np.uint8
                             )
-                        roi[~mask] = img[~mask]
+                        roi[~mask] = img_roi[~mask]
                     except Exception:
-                        pano[int(y) : int(y + h_final), int(x) : int(x + w_final)] = img
+                        pano[int(ay0) : int(ay1), int(ax0) : int(ax1)] = img_roi
                 elif blend_mode == "feather":
-                    # Feather seams against already-placed tiles using a local overlap blend. We allow
-                    # blending against more than just left/top neighbors because skewed scan lattices
-                    # can produce large diagonal overlaps.
-                    fpx = max(0, int(feather_px))
+                    # Weighted feather blend (OpenCV FeatherBlender-like) using a per-pixel weight map.
+                    # This is order-independent and blends consistently across the whole mosaic.
+                    if weights is None:
+                        pano[int(ay0) : int(ay1), int(ax0) : int(ax1)] = img[int(by0) : int(by1 + 1), int(bx0) : int(bx1 + 1)]
+                    else:
+                        img_roi = img[int(by0) : int(by1 + 1), int(bx0) : int(bx1 + 1)]
+                        roi_img = pano[int(ay0) : int(ay1), int(ax0) : int(ax1)]
+                        roi_w = weights[int(ay0) : int(ay1), int(ax0) : int(ax1)]
 
-                    x0 = int(x)
-                    y0 = int(y)
-                    x1 = int(x + w_final)
-                    y1 = int(y + h_final)
+                        fpx = max(0, int(feather_px))
+                        rect_w = int(bx1 - bx0 + 1)
+                        rect_h = int(by1 - by0 + 1)
 
-                    # First, fill any still-empty pixels (non-overlap) directly.
-                    roi0 = pano[int(y0) : int(y1), int(x0) : int(x1)]
-                    try:
-                        empty = (roi0.sum(axis=2) == 0)  # type: ignore[call-arg]
-                        if empty.any():
-                            roi0[empty] = img[empty]
-                    except Exception:
-                        pano[int(y0) : int(y1), int(x0) : int(x1)] = img
-                        empty = None  # type: ignore[assignment]
+                        xs = np.arange(int(rect_w), dtype=np.int32)
+                        dx = np.minimum(xs, (int(rect_w) - 1) - xs)
+                        ys = np.arange(int(rect_h), dtype=np.int32)
+                        dy = np.minimum(ys, (int(rect_h) - 1) - ys)
+                        if int(fpx) > 0:
+                            dx = np.minimum(dx, int(fpx))
+                            dy = np.minimum(dy, int(fpx))
+                        else:
+                            dx = dx * 0
+                            dy = dy * 0
+                        w_new = np.minimum(dy[:, None], dx[None, :]).astype(np.uint16)
+                        w_new = (w_new + np.uint16(1)).astype(np.uint16)
+                        if int(fpx) > 0:
+                            cap = int(min(65535, int(fpx) + 1))
+                            if cap < 65535:
+                                w_new = np.minimum(w_new, np.uint16(cap)).astype(np.uint16)
 
-                    # Then blend overlaps against already-placed neighbors within a small radius.
-                    if int(fpx) > 0:
-                        r0 = int(e.row)
-                        c0 = int(e.col)
-                        for dr in range(-int(layout_blend_radius), 1):
-                            for dc in range(-int(layout_blend_radius), int(layout_blend_radius) + 1):
-                                if int(dr) == 0 and int(dc) >= 0:
-                                    continue
-                                if int(dr) == 0 and int(dc) == 0:
-                                    continue
-                                nb = pos_by_rc.get((int(r0 + dr), int(c0 + dc)))
-                                if nb is None:
-                                    continue
-                                nb_x, nb_y = nb
-                                ox0 = max(int(x0), int(nb_x))
-                                oy0 = max(int(y0), int(nb_y))
-                                ox1 = min(int(x1), int(nb_x + w_final))
-                                oy1 = min(int(y1), int(nb_y + h_final))
-                                if ox1 <= ox0 or oy1 <= oy0:
-                                    continue
-                                pano_view = pano[int(oy0) : int(oy1), int(ox0) : int(ox1)]
-                                try:
-                                    if (pano_view.sum(axis=2) == 0).all():  # type: ignore[call-arg]
-                                        continue
-                                except Exception:
-                                    pass
-                                new_view = img[int(oy0 - y0) : int(oy1 - y0), int(ox0 - x0) : int(ox1 - x0)]
-                                _feather_overlap_inplace(
-                                    pano_view=pano_view,
-                                    new_view=new_view,
-                                    dx=int(x0 - nb_x),
-                                    dy=int(y0 - nb_y),
-                                    feather=int(fpx),
-                                )
+                        w_old_f = roi_w.astype(np.float32)
+                        w_new_f = w_new.astype(np.float32)
+                        w_sum_f = w_old_f + w_new_f
+                        out = (
+                            (roi_img.astype(np.float32) * w_old_f[:, :, None]) + (img_roi.astype(np.float32) * w_new_f[:, :, None])
+                        ) / w_sum_f[:, :, None]
+                        roi_img[:, :, :] = np.clip(out, 0, 255).astype(np.uint8)
+                        roi_w[:, :] = np.clip(w_sum_f, 0, 65535).astype(np.uint16)
                 else:
-                    pano[int(y) : int(y + h_final), int(x) : int(x + w_final)] = img
+                    pano[int(ay0) : int(ay1), int(ax0) : int(ax1)] = img[int(by0) : int(by1 + 1), int(bx0) : int(bx1 + 1)]
 
                 if (i % 50) == 0 or (i + 1) == int(tile_count):
                     frac = float(i + 1) / float(max(1, int(tile_count)))
@@ -2072,6 +2138,18 @@ def stitch_scan_outputs(
             except Exception:
                 pass
             memmap_path = None
+        if weights_memmap_path is not None:
+            try:
+                del weights
+            except Exception:
+                pass
+            gc.collect()
+            try:
+                if os.path.exists(weights_memmap_path):
+                    os.remove(weights_memmap_path)
+            except Exception:
+                pass
+            weights_memmap_path = None
 
         # Always emit a JPEG preview for quick sanity-checking.
         try:
@@ -2147,6 +2225,12 @@ def stitch_scan_outputs(
             try:
                 if os.path.exists(memmap_path):
                     os.remove(memmap_path)
+            except Exception:
+                pass
+        if weights_memmap_path is not None:
+            try:
+                if os.path.exists(weights_memmap_path):
+                    os.remove(weights_memmap_path)
             except Exception:
                 pass
         _write_err("stitch", exc)
