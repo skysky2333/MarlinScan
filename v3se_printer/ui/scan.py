@@ -18,7 +18,7 @@ class ScanTabMixin:
             intro,
             text=(
                 "Captures full-resolution tiles across the work area. Optional per-tile autofocus.\n"
-                "Tiles are saved as TIFF (lossless; compression configurable). Optional stitching uses an affine stitcher (feature-based for smaller scans; affine layout for larger scans).\n"
+                "Tiles are saved as TIFF (lossless; compression configurable). Optional stitching uses a layout-based affine stitcher.\n"
                 "Output: stitched TIFF (mosaic_full.tif; full-res; DPI/PPI metadata set from step size) and a JPEG preview (mosaic_thumb_2000.jpg)."
             ),
             justify=tk.LEFT,

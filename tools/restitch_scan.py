@@ -19,8 +19,7 @@ def _infer_tiles_from_dir(scan_dir: str) -> list[dict[str, object]]:
             for ent in it:
                 if not ent.is_file():
                     continue
-                name = ent.name
-                m = _TILE_RE.match(name)
+                m = _TILE_RE.match(ent.name)
                 if not m:
                     continue
                 try:
@@ -30,7 +29,7 @@ def _infer_tiles_from_dir(scan_dir: str) -> list[dict[str, object]]:
                             "col": int(m.group("col")),
                             "x_mm": float(m.group("x")),
                             "y_mm": float(m.group("y")),
-                            "file": str(name),
+                            "file": str(ent.name),
                         }
                     )
                 except Exception:
@@ -49,42 +48,29 @@ def main(argv: list[str] | None = None) -> int:
 
     ap = argparse.ArgumentParser(description="Rebuild stitched outputs for an existing scan folder (tiles.json).")
     ap.add_argument("scan_dir", help="Path to a scan folder (contains tiles.json and tile_*.tif/.png).")
-    ap.add_argument("--pyramid", action="store_true", help="Keep stitched TIFF (mosaic_full.tif).")
-    ap.add_argument("--crop", action="store_true", help="Crop panorama to largest interior rectangle (default: off).")
+
     ap.add_argument(
-        "--confidence-threshold",
-        type=float,
-        default=None,
-        help="Match confidence threshold for including edges/images (default: auto).",
-    )
-    ap.add_argument(
-        "--range-width",
-        type=int,
-        default=None,
-        help="Limit pairwise matching to neighbors within this index distance (default: auto).",
-    )
-    ap.add_argument(
-        "--max-direct-tiles",
-        type=int,
-        default=None,
-        help="Max tiles to stitch in one pass before switching to layout mode (default: auto).",
+        "--compression",
+        choices=["none", "lzw", "deflate"],
+        default="lzw",
+        help="TIFF compression for stitched outputs (default: lzw).",
     )
     ap.add_argument(
         "--max-panorama-pixels",
         type=int,
         default=None,
-        help="Safety cap for stitched mosaic pixels (default: 2000000000). Increase for full-res big scans (risk: huge RAM/disk).",
+        help="Safety cap for stitched mosaic pixels (default: 2000000000). Increase for big scans (risk: huge RAM/disk).",
     )
     ap.add_argument(
         "--final-megapix",
         type=float,
         default=None,
-        help="Final resolution per input image (MP). Use -1 for full-res (default: auto).",
+        help="Final resolution per input image (MP). Use -1 for full-res (default: full-res).",
     )
     ap.add_argument(
         "--lossless",
         action="store_true",
-        help="Convenience flag: try full-res output (sets --final-megapix -1 and disables averaging).",
+        help="Convenience flag: full-res output with no blending or exposure changes.",
     )
     ap.add_argument(
         "--dpi",
@@ -103,97 +89,69 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable scratch-file backing for huge mosaics (not recommended).",
     )
-    ap.add_argument(
-        "--medium-megapix",
-        type=float,
-        default=None,
-        help="Medium resolution per input image (MP; affects features; default: auto).",
-    )
-    ap.add_argument("--low-megapix", type=float, default=None, help="Low resolution per input image (MP; default: auto).")
-    ap.add_argument(
-        "--detector",
-        choices=["orb", "sift", "brisk", "akaze"],
-        default=None,
-        help="Feature detector (default: auto).",
-    )
-    ap.add_argument(
-        "--finder",
-        choices=["dp_color", "dp_colorgrad", "gc_color", "gc_colorgrad", "voronoi", "no"],
-        default=None,
-        help="Seam finder (default: auto).",
-    )
-    ap.add_argument("--nfeatures", type=int, default=None, help="ORB features per image (default: auto).")
-    ap.add_argument(
-        "--orb-fast-threshold",
-        type=int,
-        default=None,
-        help="ORB FAST threshold (lower finds more keypoints; default: auto).",
-    )
-    ap.add_argument(
-        "--neighbor-match",
-        choices=["4", "8"],
-        default=None,
-        help="Match 4-neighbors (R/D) or 8-neighbors (adds diagonals) for tile grids (default: auto).",
-    )
+
     ap.add_argument(
         "--layout-megapix",
         type=float,
         default=None,
-        help="Megapix used to estimate step vectors for large scans (default: auto).",
+        help="Megapix used to estimate step vectors (default: auto).",
     )
     ap.add_argument(
         "--layout-samples",
         type=int,
         default=None,
-        help="Number of neighbor pairs to sample per direction for layout (default: auto).",
+        help="Number of neighbor pairs to sample per direction for step estimation (default: 250).",
     )
     ap.add_argument(
         "--layout-nfeatures",
         type=int,
         default=None,
-        help="ORB features per image for layout step estimation (default: auto).",
+        help="ORB features per image for step estimation (default: 2000).",
+    )
+    ap.add_argument(
+        "--layout-orb-fast-threshold",
+        type=int,
+        default=None,
+        help="ORB FAST threshold for step estimation (default: 10).",
     )
     ap.add_argument(
         "--layout-min-inliers",
         type=int,
         default=None,
-        help="Min RANSAC inliers to accept a layout step estimate (default: auto).",
+        help="Min inliers to accept an estimated step (default: 10).",
     )
     ap.add_argument(
         "--layout-blend",
         choices=["overwrite", "average", "feather"],
         default=None,
-        help="Compositing mode for layout stitching (default: feather).",
+        help="Compositing mode (default: feather).",
     )
     ap.add_argument(
         "--layout-feather-px",
         type=int,
         default=None,
-        help="Feather width in px (final resolution) for --layout-blend feather (default: auto).",
+        help="Feather width in px (final resolution) for feather blending (default: auto).",
     )
-    ap.add_argument(
-        "--layout-blend-radius",
-        type=int,
-        default=None,
-        help="Blend against already-placed neighbors within this grid radius in layout mode (default: 2).",
-    )
+    ap.add_argument("--blend-strength", type=float, default=None, help="Blend strength (default: 5).")
+
     ap.add_argument(
         "--no-layout-exposure",
         action="store_true",
-        help="Disable per-tile exposure compensation (gain) in layout mode (default: enabled).",
+        help="Disable per-tile exposure compensation (default: enabled).",
     )
     ap.add_argument(
         "--layout-gain-min",
         type=float,
         default=None,
-        help="Minimum per-tile exposure gain in layout mode (default: 0.5).",
+        help="Minimum per-tile exposure gain (default: 0.5).",
     )
     ap.add_argument(
         "--layout-gain-max",
         type=float,
         default=None,
-        help="Maximum per-tile exposure gain in layout mode (default: 2.0).",
+        help="Maximum per-tile exposure gain (default: 2.0).",
     )
+
     ap.add_argument(
         "--no-layout-black-transparent",
         action="store_true",
@@ -205,22 +163,23 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Threshold (0–32) for detecting black borders to treat as transparent (default: 2).",
     )
+
     ap.add_argument(
         "--no-layout-refine",
         action="store_true",
-        help="Disable local position refinement in layout mode (faster, but more visible seams/misalignment).",
+        help="Disable local position refinement (faster, but more visible seams/misalignment).",
     )
     ap.add_argument(
         "--layout-refine-megapix",
         type=float,
         default=None,
-        help="Megapix used for layout position refinement (default: auto).",
+        help="Megapix used for refinement (default: auto).",
     )
     ap.add_argument(
         "--layout-refine-patch",
         type=int,
         default=None,
-        help="Patch size (px, refine resolution) for phase correlation during layout refinement (default: 384).",
+        help="Patch size (px, refine resolution) for phase correlation during refinement (default: 384).",
     )
     ap.add_argument(
         "--layout-refine-resp-thresh",
@@ -252,47 +211,21 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="RNG seed for layout sampling (default: 0).",
     )
-    ap.add_argument(
-        "--blender-type",
-        choices=["multiband", "no"],
-        default=None,
-        help="Blending type (default: auto).",
-    )
-    ap.add_argument("--blend-strength", type=float, default=None, help="Blending strength (default: auto).")
-    ap.add_argument(
-        "--compression",
-        choices=["none", "lzw", "deflate"],
-        default="lzw",
-        help="TIFF compression for stitched outputs (default: lzw).",
-    )
-    ap.add_argument(
-        "--tiff-tile",
-        action="store_true",
-        help="Force tiled TIFF output (default: auto).",
-    )
-    ap.add_argument(
-        "--tiff-strip",
-        action="store_true",
-        help="Force strip-based TIFF output (default: auto).",
-    )
-    ap.add_argument(
-        "--tiff-tile-width",
-        type=int,
-        default=None,
-        help="Tile width (px) when writing tiled TIFFs (default: 256).",
-    )
-    ap.add_argument(
-        "--tiff-tile-height",
-        type=int,
-        default=None,
-        help="Tile height (px) when writing tiled TIFFs (default: 256).",
-    )
+
+    ap.add_argument("--preview-max-dim", type=int, default=None, help="Preview JPEG max dimension (default: 2000).")
+    ap.add_argument("--preview-quality", type=int, default=None, help="Preview JPEG quality (default: 85).")
+
+    ap.add_argument("--tiff-tile", action="store_true", help="Force tiled TIFF output (default: auto).")
+    ap.add_argument("--tiff-strip", action="store_true", help="Force strip-based TIFF output (default: auto).")
+    ap.add_argument("--tiff-tile-width", type=int, default=None, help="Tile width (px) for tiled TIFFs (default: 256).")
+    ap.add_argument("--tiff-tile-height", type=int, default=None, help="Tile height (px) for tiled TIFFs (default: 256).")
     ap.add_argument(
         "--tiff-predictor",
         choices=["none", "horizontal", "float"],
         default=None,
-        help="TIFF predictor (default: auto).",
+        help="TIFF predictor (default: horizontal).",
     )
+
     args = ap.parse_args(argv)
 
     scan_dir = os.path.abspath(os.path.expanduser(str(args.scan_dir)))
@@ -300,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.isdir(scan_dir):
         print(f"Error: not a directory: {scan_dir}", file=sys.stderr)
         return 2
+
     tiles = None
     if os.path.exists(tiles_path):
         try:
@@ -313,16 +247,11 @@ def main(argv: list[str] | None = None) -> int:
         if not tiles:
             print(f"Error: no tiles found (tiles.json missing and no tile_*.tif files parsed): {scan_dir}", file=sys.stderr)
             return 2
-        # Best-effort: write tiles.json for future runs.
         try:
             with open(tiles_path, "w", encoding="utf-8") as f:
                 json.dump(tiles, f, indent=2, sort_keys=False)
         except Exception:
             pass
-
-    build_pyramid = bool(args.pyramid)
-    if not build_pyramid:
-        build_pyramid = True
 
     try:
         from v3se_printer.scan.stitch_outputs import stitch_scan_outputs
@@ -331,14 +260,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{pct:5.1f}% {msg}", file=sys.stderr)
 
         stitch_settings: dict[str, object] = {}
-        if bool(args.crop):
-            stitch_settings["crop"] = True
-        if args.confidence_threshold is not None:
-            stitch_settings["confidence_threshold"] = float(args.confidence_threshold)
-        if args.range_width is not None:
-            stitch_settings["range_width"] = int(args.range_width)
-        if args.max_direct_tiles is not None:
-            stitch_settings["max_direct_tiles"] = int(args.max_direct_tiles)
         if args.max_panorama_pixels is not None:
             stitch_settings["max_panorama_pixels"] = int(args.max_panorama_pixels)
         if args.final_megapix is not None:
@@ -346,7 +267,6 @@ def main(argv: list[str] | None = None) -> int:
         if bool(getattr(args, "lossless", False)):
             stitch_settings["final_megapix"] = -1.0
             stitch_settings["layout_blend"] = "overwrite"
-            stitch_settings["blender_type"] = "no"
             stitch_settings["layout_exposure_compensate"] = False
         if bool(getattr(args, "no_memmap", False)):
             stitch_settings["use_memmap"] = False
@@ -354,44 +274,36 @@ def main(argv: list[str] | None = None) -> int:
             stitch_settings["output_dpi"] = float(args.dpi)
         if args.dpi_round_px_per_mm is not None:
             stitch_settings["dpi_round_px_per_mm"] = float(args.dpi_round_px_per_mm)
-        if args.medium_megapix is not None:
-            stitch_settings["medium_megapix"] = float(args.medium_megapix)
-        if args.low_megapix is not None:
-            stitch_settings["low_megapix"] = float(args.low_megapix)
-        if args.detector is not None:
-            stitch_settings["detector"] = str(args.detector)
-        if args.finder is not None:
-            stitch_settings["finder"] = str(args.finder)
-        if args.nfeatures is not None:
-            stitch_settings["nfeatures"] = int(args.nfeatures)
-        if args.orb_fast_threshold is not None:
-            stitch_settings["orb_fast_threshold"] = int(args.orb_fast_threshold)
-        if args.neighbor_match is not None:
-            stitch_settings["neighbor_match"] = str(args.neighbor_match)
+
         if args.layout_megapix is not None:
             stitch_settings["layout_megapix"] = float(args.layout_megapix)
         if args.layout_samples is not None:
             stitch_settings["layout_samples"] = int(args.layout_samples)
         if args.layout_nfeatures is not None:
             stitch_settings["layout_nfeatures"] = int(args.layout_nfeatures)
+        if args.layout_orb_fast_threshold is not None:
+            stitch_settings["layout_orb_fast_threshold"] = int(args.layout_orb_fast_threshold)
         if args.layout_min_inliers is not None:
             stitch_settings["layout_min_inliers"] = int(args.layout_min_inliers)
         if args.layout_blend is not None:
             stitch_settings["layout_blend"] = str(args.layout_blend)
         if args.layout_feather_px is not None:
             stitch_settings["layout_feather_px"] = int(args.layout_feather_px)
-        if args.layout_blend_radius is not None:
-            stitch_settings["layout_blend_radius"] = int(args.layout_blend_radius)
+        if args.blend_strength is not None:
+            stitch_settings["blend_strength"] = float(args.blend_strength)
+
         if bool(getattr(args, "no_layout_exposure", False)):
             stitch_settings["layout_exposure_compensate"] = False
         if args.layout_gain_min is not None:
             stitch_settings["layout_gain_min"] = float(args.layout_gain_min)
         if args.layout_gain_max is not None:
             stitch_settings["layout_gain_max"] = float(args.layout_gain_max)
+
         if bool(getattr(args, "no_layout_black_transparent", False)):
             stitch_settings["layout_black_transparent"] = False
         if args.layout_black_threshold is not None:
             stitch_settings["layout_black_threshold"] = int(args.layout_black_threshold)
+
         if args.layout_seed is not None:
             stitch_settings["layout_seed"] = int(args.layout_seed)
         if bool(getattr(args, "no_layout_refine", False)):
@@ -408,10 +320,12 @@ def main(argv: list[str] | None = None) -> int:
             stitch_settings["layout_refine_prior_weight"] = float(args.layout_refine_prior_weight)
         if args.layout_refine_max_edges is not None:
             stitch_settings["layout_refine_max_edges"] = int(args.layout_refine_max_edges)
-        if args.blender_type is not None:
-            stitch_settings["blender_type"] = str(args.blender_type)
-        if args.blend_strength is not None:
-            stitch_settings["blend_strength"] = float(args.blend_strength)
+
+        if args.preview_max_dim is not None:
+            stitch_settings["preview_max_dim"] = int(args.preview_max_dim)
+        if args.preview_quality is not None:
+            stitch_settings["preview_quality"] = int(args.preview_quality)
+
         if bool(getattr(args, "tiff_tile", False)) and bool(getattr(args, "tiff_strip", False)):
             print("Error: pass only one of --tiff-tile / --tiff-strip", file=sys.stderr)
             return 2
@@ -429,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         stitch_scan_outputs(
             tiles=list(tiles) if isinstance(tiles, list) else [],
             out_dir=str(scan_dir),
-            build_pyramidal_tiff=bool(build_pyramid),
+            build_pyramidal_tiff=True,
             tiff_compression=str(args.compression),
             progress_cb=_progress,
             stitch_settings=stitch_settings or None,
@@ -447,3 +361,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
