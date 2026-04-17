@@ -1,2 +1,1 @@
-"""Tkinter UI mixins and tab builders for the v3se printer GUI."""
-
+"""Tkinter UI mixins and tab builders for MarlinScan."""

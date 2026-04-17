@@ -89,7 +89,7 @@ class PrinterGUI(
 ):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Ender-3 V3 SE Serial Control (Marlin)")
+        self.title("MarlinScan")
         self.minsize(1050, 640)
 
         self._ser: serial.Serial | None = None

@@ -1,10 +1,10 @@
 # MarlinScan
 
-`MarlinScan` is a driver for creating large-format, high-resolution scans with a Marlin-based printer, built around the Ender-3 V3 SE. The core idea is simple: use the printer as an XY motion stage, capture full-resolution camera tiles across the bed, and stitch them into a single large mosaic. It includes a 3d model to securly mount arbitrary scanner head or lens to the printer.
+`MarlinScan` is a scanning workstation for creating large-format, high-resolution scans with a Marlin-based printer, built around the Ender-3 V3 SE. The core idea is simple: use the printer as an XY motion stage, capture full-resolution camera tiles across the bed, and stitch them into a single large mosaic. The repo also includes a 3D model for mounting a scanner head or lens to the printer.
 
 Printer control, camera setup, preview, autofocus, and realtime motion tools are all there to support that scanning workflow.
 
-The app is still run directly from the repo. There is no packaging layer yet.
+The app is still run directly from the repo. There is no packaging layer yet. The Python package name remains `v3se_printer` for now, so the launch command is still `python -m v3se_printer`.
 
 ## Safety
 
