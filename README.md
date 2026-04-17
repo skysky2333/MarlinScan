@@ -1,69 +1,168 @@
-# v3se (Ender-3 V3 SE serial control)
+# v3se
 
-Small Tkinter app for sending G-code over serial to a Marlin-based printer (tested with Ender-3 V3 SE).
+`v3se` is a Tkinter workstation for creating large-format, high-resolution scans with a Marlin-based printer, built around the Ender-3 V3 SE. The core idea is simple: use the printer as an XY motion stage, capture full-resolution camera tiles across the bed, and stitch them into a single large mosaic. It includes a 3d model to securly mount arbitrary scanner head or lens to the printer.
 
-## Setup
+Printer control, camera setup, preview, autofocus, and realtime motion tools are all there to support that scanning workflow.
 
-- Python 3.10+ recommended
-- Install dependency:
-  - `python -m pip install pyserial`
-  - Optional (UVC camera + scan stitching): `python -m pip install opencv-python stitching`
-  - Optional (preview rendering fallback): `python -m pip install pillow`
-
-## Run
-
-- `python -m v3se_printer`
-
-## Code layout
-
-- `v3se_printer/app.py`: main Tkinter app + serial worker integration
-- `v3se_printer/ui/`: tab builders and realtime control logic (split out of the old monolithic GUI file)
-- `v3se_printer/scan/`: non-UI scan capture + stitching helpers
+The app is still run directly from the repo. There is no packaging layer yet.
 
 ## Safety
 
-- This tool can move the printer immediately. Keep the bed clear and the nozzle at a safe Z height.
-- Be ready to hit **EMERGENCY STOP (M112)** in the UI or power off the printer.
+- This app can move the printer immediately.
+- Homing, realtime jogging, autofocus, and scanning all cause motion.
+- Keep the bed clear, keep the nozzle at a safe Z height, and watch the machine while it is moving.
+- Be ready to use **EMERGENCY STOP (M112)** in the UI or cut power if needed.
 
-## Bed Realtime (mouse tracking)
+## Primary Focus
 
-Open the **Bed Realtime** tab to stream small XY moves that “chase” your mouse position.
+- Large-format scan capture
+  - Full-resolution TIFF tile capture across a configurable XY area
+  - Serpentine scan order for efficient bed coverage
+  - Multi-shot capture modes: `none`, `best`, `nlmeans`
+  - Output folders with saved scan parameters and tile metadata
+- Focus control for scan quality
+  - Live preview with sharpness readout and history plot
+  - Printer-driven Z autofocus
+  - Optional focus-mesh calibration
+  - Optional autofocus at each tile during the scan
+- High-resolution stitched outputs
+  - Automatic stitching into a large mosaic TIFF
+  - JPEG preview generation for quick inspection
+  - Offline restitching from previously captured tiles
 
-How it works:
+## Supporting Capabilities
 
-- The app sends many tiny relative moves (`G91` + repeated `G0 X… Y… F…`).
-- Marlin queues motion internally, so this is best-effort and not hard real-time. If you queue moves faster than the printer can execute them, it will lag.
+- Printer connection and control
+  - USB serial connect/disconnect
+  - Port + baud auto-detection against Marlin using `M115`
+  - Background status polling with `M105` / `M114`
+  - Firmware config import from `M503`
+  - Raw G-code console
+- Motion workflows
+  - Quick actions for info, homing, leveling, mesh on/off, reset, and EEPROM commands
+  - Relative jog, absolute go-to, relative move, and extrude/retract
+  - Bed view for point-and-click absolute targeting
+  - Realtime keyboard jog
+  - Realtime mouse-follow XY control on the bed canvas
+- Camera configuration
+  - UVC device scan/connect
+  - Resolution, FPS, FourCC, rotation, crop, and best-effort UVC control tuning
+- Printer tuning
+  - Hotend and bed setpoints
+  - Fan control
+  - Feed override (`M220`), flow override (`M221`), acceleration override (`M204`)
+- Helper tools
+  - Re-stitch an existing scan folder from saved tiles
+  - Benchmark serial `ok` timing for realtime jog tuning
 
-Controls:
+## Hardware Assumptions
 
-- **Start / Stop**: starts/stops streaming. While running, the UI switches the printer to relative mode (G91) and restores your previous mode on stop.
-- **Hold left mouse to move**: when enabled (default), the printer only moves while you hold the left mouse button on the canvas.
-- **Home X/Y on Start (G28 X Y)**: optional. Note: some firmwares may raise Z slightly during homing even when only X/Y are requested.
-- **Tick (Hz)**: update rate. Typical starting range: 20–60 Hz.
-- **Max step/tick (mm)**: maximum distance per tick.
-- **Deadband (mm)**: don’t move when already close to target (reduces jitter).
-- **Buffer (ms)**: small lookahead queue (reduces choppiness). Lower = more responsive, higher = smoother but more input lag.
-- **Sync each tick (M400)**: waits for moves to finish each tick. This reduces “queued lag” but can feel steppy and limits max tick rate.
-- **Motion Boost (optional)**: temporarily applies `M201`/`M204`/`M205 J` while running (helps short-segment motion), then restores values on stop.
+- The defaults are tuned around an Ender-3 V3 SE running Marlin-compatible G-code.
+- The work area defaults assume a roughly `220 x 220 x 250 mm` printer.
+- Other Marlin printers may work, but you should expect to retune bounds, speeds, autofocus ranges, and scan settings.
+- The `3dModel/scaner_mount.stl` file is a related hardware model for the scanner/camera setup.
 
-Tuning tip:
+## Dependencies
 
-- Effective XY speed is approximately `min(SpeedXY, tick_hz * step_mm)`. For example: `40 Hz * 1.0 mm ≈ 40 mm/s`.
-- If it’s choppy with tiny steps, increase **Max step/tick** and/or **Tick (Hz)**, or enable **Motion Boost**.
+Python `3.10+` is recommended.
 
-## Realtime Keyboard (Move tab)
+Base app:
 
-The **Move** tab also has **Realtime Keyboard** controls that stream short relative moves while keys are held:
+```bash
+python -m pip install pyserial
+```
 
-- Arrow keys = X/Y
-- Shift = Z+ ; Control = Z-
+Camera preview, autofocus, and scan capture:
 
-This uses the same idea as Bed Realtime: tune **Tick (Hz)** and **Buffer (ms)** for responsiveness vs smoothness.
+```bash
+python -m pip install opencv-python numpy
+```
 
-The startup **Homing / Coordinate Setup** dialog also includes a **Manual Positioning (Keyboard Jog)** section that uses the same controls.
+Optional preview rendering fallback:
 
-## Benchmarking (optional)
+```bash
+python -m pip install pillow
+```
 
-If you want to measure how fast your firmware acknowledges small moves:
+Stitched TIFF output and the restitch CLI:
 
-- `conda run -n 3dprinter python tools/rt_bench.py --port /dev/cu.wchusbserial1120 --dx 0.5 --feed 6000 --count 80`
+```bash
+python -m pip install pyvips
+```
+
+Notes:
+
+- `pyvips` also needs a working native `libvips` install on your system.
+- Scan tile capture can still run without `pyvips`, but stitched outputs and `tools/restitch_scan.py` will fail.
+- Camera scanning and preview are optional; the printer control side only needs `pyserial`.
+
+## Running The App
+
+```bash
+python -m v3se_printer
+```
+
+## Typical Workflow
+
+1. Connect the camera if you need preview, autofocus, or scanning.
+   Use `Scan`, then `Connect`, then `Setup` / `Preview` / `Auto Focus (Z)` as needed.
+2. Connect the printer.
+   Use `Refresh` or `Auto-detect (find port/baud)`, then connect over serial.
+3. Complete the startup homing / coordinate setup dialog.
+   The app supports both automatic homing (`G28`) and manual zeroing (`G92`).
+4. Use the notebook tabs for normal control.
+   `Quick`, `Move`, `Bed`, `Bed Realtime`, `Scan`, `Temps/Fan`, `Tuning`, and `Level/EEPROM`.
+5. For scans, stop realtime modes first, confirm camera + printer are connected, choose area/step/output settings, and start the scan.
+
+## Typical Scanning Workflow
+
+1. Mount and align the camera for the bed-scanning setup.
+2. Connect the camera, open `Setup`, and dial in resolution, crop, focus, and exposure behavior.
+3. Connect the printer and complete startup homing / coordinate setup.
+4. Use preview and `Auto Focus (Z)` to find a usable capture configuration.
+5. In the `Scan` tab, define the XY area, step size, autofocus behavior, multi-shot mode, and output folder.
+6. Run the scan to save full-resolution tiles and, if stitching is enabled, build the final mosaic outputs.
+
+## Scan Output Layout
+
+Each scan is written under `scans/scan_YYYYMMDD_HHMMSS/` by default.
+
+The design target is a scan that is much larger than a single camera frame: many full-resolution tiles on disk, plus one stitched high-resolution output when reconstruction succeeds.
+
+Typical contents:
+
+- `scan_params.json`: saved scan settings
+- `tiles.json`: tile index with row/column and XY positions
+- `tile_r###_c###_x..._y....tif`: captured full-resolution tiles
+- `mosaic_full.tif`: stitched mosaic if stitching succeeds
+- `mosaic_thumb_2000.jpg`: preview JPEG if preview generation succeeds
+- `stitch_meta.json`: stitch metadata
+- `stitch_error.txt`: stitch failure details when stitching fails
+
+If stitching fails, the tiles are still kept and can be restitched later.
+
+## Helper Tools
+
+Realtime serial benchmark:
+
+```bash
+python tools/rt_bench.py --port /dev/cu.wchusbserial1120 --dx 0.5 --feed 6000 --count 80
+```
+
+Restitch an existing scan folder:
+
+```bash
+python tools/restitch_scan.py scans/scan_YYYYMMDD_HHMMSS
+```
+
+`tools/restitch_scan.py` exposes many tuning flags for blend mode, refinement, DPI metadata, TIFF layout, and preview generation if you need to rebuild outputs without re-running the scan.
+
+## Repo Layout
+
+- `v3se_printer/app.py`: main Tkinter application and integration point
+- `v3se_printer/ui/`: notebook tabs for motion, scan, tuning, maintenance, and realtime controls
+- `v3se_printer/serial_worker.py`: queued serial I/O worker with immediate-path emergency stop support
+- `v3se_printer/uvc.py`: UVC camera config, probing, transforms, and sharpness helpers
+- `v3se_printer/scan/`: scan execution, tile I/O, stitching, and output writing
+- `tools/`: CLI helpers
+- `3dModel/`: related hardware model files
