@@ -1,6 +1,6 @@
 # MarlinScan
 
-`MarlinScan` is a scanning workstation for creating large-format, high-resolution scans with a Marlin-based printer, built around the Ender-3 V3 SE. The core idea is simple: use the printer as an XY motion stage, capture full-resolution camera tiles across the bed, and stitch them into a single large mosaic. The repo also includes a 3D model for mounting a scanner head or lens to the printer.
+`MarlinScan` is a scanning workstation for creating large-format, high-resolution scans with a Marlin-based printer, built around the Ender-3 V3 SE. The core idea is simple: use the printer as an XY motion stage, capture full-resolution camera tiles across the bed, and stitch them into a single large mosaic. The repo also includes separate hardware models for printer-controlled scanning and the standalone camera server.
 
 Printer control, camera setup, preview, autofocus, and realtime motion tools are all there to support that scanning workflow.
 
@@ -60,7 +60,8 @@ The app is still run directly from the repo. There is no packaging layer yet. Th
 - The defaults are tuned around an Ender-3 V3 SE running Marlin-compatible G-code.
 - The work area defaults assume a roughly `220 x 220 x 250 mm` printer.
 - Other Marlin printers may work, but you should expect to retune bounds, speeds, autofocus ranges, and scan settings.
-- The `3dModel/scaner_mount.stl` file is a related hardware model for the scanner/camera setup.
+- The original printer-controlled scan mount is in `3dModel/printer_scan/`.
+- The standalone camera-server stand is in `camera_server/cad/printable/`.
 
 ## Dependencies
 
@@ -101,6 +102,49 @@ Notes:
 ```bash
 python -m v3se_printer
 ```
+
+## Standalone Camera Stream
+
+The `camera_server` package serves the camera without starting the printer UI. The browser scans the available camera indices, lets you pick one, and opens a full-window preview. The default Detail mode requests `3840x2160` and paces the browser stream at `15 FPS`; Smooth mode provides a `1920x1080` option at the same paced rate. Both modes request `MJPG` capture and accept the resolution the camera actually provides.
+
+Run it from the requested Conda environment:
+
+```bash
+conda activate 3dprinter
+python -m camera_server
+```
+
+Or without activating the environment:
+
+```bash
+conda run -n 3dprinter python -m camera_server
+```
+
+Open `http://127.0.0.1:8000/`. The default bind is local to this Mac. To expose the viewer on the workstation's LAN addresses, opt in explicitly:
+
+```bash
+python -m camera_server --host 0.0.0.0
+```
+
+Available endpoints:
+
+- `/`: full-window live viewer
+- `/cameras.json`: cached camera discovery results
+- `POST /cameras/scan`: rescan camera indices
+- `POST /camera`: select a camera and preview profile
+- `DELETE /camera`: stop the active preview
+- `POST /settings`: set software red, green, and blue gains
+- `POST /white-balance`: calibrate or toggle automatic software white balance from a normalized gray region
+- `/stream.mjpg`: MJPEG stream at the active profile resolution
+- `/snapshot.jpg`: current JPEG at the active profile resolution
+- `/status.json`: requested and actual capture details
+- `/healthz`: `200` while a fresh camera frame is available
+
+For automatic correction, place a gray or white neutral reference in view, enable **Auto WB**, then drag over that reference when the picker opens. **Pick gray** also works with Auto WB off for a one-time calibration; leaving Auto WB on resamples the same region continuously. Dark, clipped, or stale selections are rejected without changing the current gains. The R/G/B sliders provide a manual override and turn Auto WB off when adjusted.
+
+Both automatic and manual correction use software gains because macOS camera backends often ignore UVC white-balance controls. The server also requests that device-level auto white balance be disabled so it does not fight the software correction when the backend honors that control. Initial manual gains can be set with `--red-gain`, `--green-gain`, and `--blue-gain`.
+
+Only one process can own most UVC cameras at a time, so close the MarlinScan desktop app before starting the standalone server. On macOS, allow the terminal or Python launcher under **System Settings > Privacy & Security > Camera**. Use `python -m camera_server --help` to change the initial profile, scan range, requested capture FPS, FourCC, port, JPEG quality, or color gains.
 
 ## Typical Workflow
 
@@ -164,5 +208,6 @@ python tools/restitch_scan.py scans/scan_YYYYMMDD_HHMMSS
 - `v3se_printer/serial_worker.py`: queued serial I/O worker with immediate-path emergency stop support
 - `v3se_printer/uvc.py`: UVC camera config, probing, transforms, and sharpness helpers
 - `v3se_printer/scan/`: scan execution, tile I/O, stitching, and output writing
+- `camera_server/`: standalone browser camera server and its dedicated CAD models
 - `tools/`: CLI helpers
-- `3dModel/`: related hardware model files
+- `3dModel/printer_scan/`: original STEP and STL mount for printer-controlled scanning
