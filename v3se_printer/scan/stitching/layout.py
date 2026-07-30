@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 from typing import Any, Callable
 
-from .composite import auto_feather_px, composite_tiles
+from ...progress import ProgressCallback
+from .composite import auto_feather_px, composite_tiles, read_composite_image, tile_positions
 from .refine import refine_positions_and_gains
 from .step_estimation import estimate_step_vectors
 from .types import Entry, LayoutMosaic
@@ -25,7 +26,9 @@ def stitch_layout_mosaic(
     out_dir: str,
     settings: dict[str, object],
     final_megapix: float,
-    progress_cb: Callable[[float, str], None] | None,
+    composite_dtype: str,
+    progress_cb: ProgressCallback | None,
+    cancel_cb: Callable[[], None] | None,
 ) -> LayoutMosaic:
     tile_count = int(len(entries))
 
@@ -50,9 +53,18 @@ def stitch_layout_mosaic(
     h_final = max(1, int(round(float(tile_h) * float(scale_final))))
 
     if int(tile_count) == 1:
-        img0 = cv2.imread(str(entries[0].path), cv2.IMREAD_COLOR)
-        if img0 is None:
-            raise RuntimeError("Failed to read the only tile.")
+        if progress_cb is not None:
+            progress_cb("stitch-composite", "Compositing tiles", 0, 1, "tiles")
+        if cancel_cb is not None:
+            cancel_cb()
+        img0 = read_composite_image(
+            cv2=cv2,
+            np=np,
+            path=entries[0].composite_path,
+            expected_w=int(tile_w),
+            expected_h=int(tile_h),
+            expected_dtype=np.dtype(composite_dtype),
+        )
         if int(img0.shape[1]) != int(w_final) or int(img0.shape[0]) != int(h_final):
             img0 = cv2.resize(img0, (int(w_final), int(h_final)), interpolation=cv2.INTER_AREA)
         stage = {
@@ -61,10 +73,27 @@ def stitch_layout_mosaic(
             "tiles_used": 1,
             "strategy": "single_tile",
             "final_megapix": float(final_megapix),
+            "composite_dtype": str(composite_dtype),
             "blend": str(blend_mode),
             "blend_strength": float(settings.get("blend_strength", 5.0)),
+            "source_size_px": [int(tile_w), int(tile_h)],
+            "tile_size_px": [int(w_final), int(h_final)],
+            "canvas_size_px": [int(w_final), int(h_final)],
+            "tile_transforms": [
+                {
+                    "row": int(entries[0].row),
+                    "col": int(entries[0].col),
+                    "solved_position_px": [0.0, 0.0],
+                    "applied_position_px": [0, 0],
+                    "matrix": [
+                        [float(w_final) / float(tile_w), 0.0, 0.0],
+                        [0.0, float(h_final) / float(tile_h), 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                }
+            ],
         }
-        return LayoutMosaic(
+        result = LayoutMosaic(
             pano=img0,
             out_w=int(w_final),
             out_h=int(h_final),
@@ -72,9 +101,9 @@ def stitch_layout_mosaic(
             weights_memmap_path=None,
             stage_meta=stage,
         )
-
-    if progress_cb is not None:
-        progress_cb(5.0, "Stitching: estimating affine step vectors…")
+        if progress_cb is not None:
+            progress_cb("stitch-composite", "Compositing tiles", 1, 1, "tiles")
+        return result
 
     right_possible = int(nrows) * max(0, int(ncols) - 1)
     down_possible = max(0, int(nrows) - 1) * int(ncols)
@@ -98,6 +127,8 @@ def stitch_layout_mosaic(
         settings=settings,
         final_megapix=float(final_megapix),
         min_kept=int(layout_min_kept),
+        progress_cb=progress_cb,
+        cancel_cb=cancel_cb,
     )
     if step_meta is None:
         raise RuntimeError(
@@ -120,6 +151,7 @@ def stitch_layout_mosaic(
     strategy_settings: dict[str, object] = {
         "strategy": "layout",
         "final_megapix": float(final_megapix),
+        "composite_dtype": str(composite_dtype),
         **dict(step_meta),
         "blend": str(blend_mode),
         "blend_strength": float(settings.get("blend_strength", 5.0)),
@@ -153,9 +185,9 @@ def stitch_layout_mosaic(
     refined_gains: list[float] | None = None
     refine_meta: dict[str, object] = {"enabled": False}
     if bool(refine_positions) and int(tile_count) >= 4 and int(nrows) >= 1 and int(ncols) >= 1:
-        if progress_cb is not None:
-            progress_cb(7.0, "Stitching: refining tile positions…")
-
+        refine_settings = settings
+        if np.dtype(composite_dtype) != np.dtype(np.uint8):
+            refine_settings = {**settings, "layout_exposure_compensate": False}
         refined_by_rc, refined_gains, refine_meta = refine_positions_and_gains(
             cv2=cv2,
             np=np,
@@ -170,10 +202,9 @@ def stitch_layout_mosaic(
             orig_mp=float(orig_mp),
             scale_final=float(scale_final),
             step_meta=dict(step_meta),
-            settings=settings,
+            settings=refine_settings,
             progress_cb=progress_cb,
-            progress_base=7.0,
-            progress_span=2.0,
+            cancel_cb=cancel_cb,
         )
 
     strategy_settings["layout_refine_positions"] = dict(refine_meta)
@@ -201,6 +232,39 @@ def stitch_layout_mosaic(
             f"Affine layout would be too large ({out_w}x{out_h} px). "
             "Lower final_megapix, scan a smaller area, or increase max_panorama_pixels (expect huge RAM/disk)."
         )
+
+    positions_by_rc = tile_positions(
+        entries=entries,
+        pos_by_rc_f=pos_by_rc_f,
+        min_x=min_x,
+        min_y=min_y,
+    )
+    tile_transforms: list[dict[str, object]] = []
+    for entry in entries:
+        key = (int(entry.row), int(entry.col))
+        solved_x, solved_y = pos_by_rc_f[key]
+        applied_x, applied_y = positions_by_rc[key]
+        tile_transforms.append(
+            {
+                "row": key[0],
+                "col": key[1],
+                "solved_position_px": [float(solved_x - min_x), float(solved_y - min_y)],
+                "applied_position_px": [int(applied_x), int(applied_y)],
+                "matrix": [
+                    [float(w_final) / float(tile_w), 0.0, float(applied_x)],
+                    [0.0, float(h_final) / float(tile_h), float(applied_y)],
+                    [0.0, 0.0, 1.0],
+                ],
+            }
+        )
+    strategy_settings.update(
+        {
+            "source_size_px": [int(tile_w), int(tile_h)],
+            "tile_size_px": [int(w_final), int(h_final)],
+            "canvas_size_px": [int(out_w), int(out_h)],
+            "tile_transforms": tile_transforms,
+        }
+    )
 
     if blend_mode == "feather":
         feather_mode = "user" if feather_px is not None else "auto"
@@ -238,6 +302,9 @@ def stitch_layout_mosaic(
         out_h=int(out_h),
         w_final=int(w_final),
         h_final=int(h_final),
+        source_w=int(tile_w),
+        source_h=int(tile_h),
+        composite_dtype=str(composite_dtype),
         out_dir=str(out_dir),
         blend_mode=str(blend_mode),
         feather_px=int(feather_px or 0) if blend_mode == "feather" else None,
@@ -247,8 +314,7 @@ def stitch_layout_mosaic(
         black_threshold=int(black_threshold),
         refined_gains=refined_gains,
         progress_cb=progress_cb,
-        progress_base=10.0,
-        progress_span=80.0,
+        cancel_cb=cancel_cb,
     )
 
     stage = {"name": "layout", "tiles_in": int(tile_count), "tiles_used": int(tile_count), **strategy_settings}

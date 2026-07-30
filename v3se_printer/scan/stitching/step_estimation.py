@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Callable
 
+from ...progress import ProgressCallback
 from .util import median, scale_for_megapix
 
 
@@ -20,6 +21,8 @@ def estimate_step_vectors(
     settings: dict[str, object],
     final_megapix: float,
     min_kept: int,
+    progress_cb: ProgressCallback | None,
+    cancel_cb: Callable[[], None] | None,
 ) -> dict[str, object] | None:
     """
     Estimate per-step translation vectors between neighboring tiles, scaled to the requested
@@ -203,36 +206,47 @@ def estimate_step_vectors(
     down_candidates = [(r, c) for r in range(int(nrows) - 1) for c in range(int(ncols))]
     rng.shuffle(right_candidates)
     rng.shuffle(down_candidates)
+    right_candidates = right_candidates[: max(1, int(layout_samples))]
+    down_candidates = down_candidates[: max(1, int(layout_samples))]
+    sampled_pairs = [
+        (str(by_rc[(r, c)]), str(by_rc[(r, c + 1)]), r, c, "right")
+        for r, c in right_candidates
+        if (r, c) in by_rc and (r, c + 1) in by_rc
+    ] + [
+        (str(by_rc[(r, c)]), str(by_rc[(r + 1, c)]), r, c, "down")
+        for r, c in down_candidates
+        if (r, c) in by_rc and (r + 1, c) in by_rc
+    ]
+    if progress_cb is not None:
+        progress_cb("stitch-align", "Aligning neighboring tiles", 0, len(sampled_pairs), "pairs")
 
     right_vecs: list[tuple[float, float]] = []
     down_vecs: list[tuple[float, float]] = []
     down_vecs_even: list[tuple[float, float]] = []
     down_vecs_odd: list[tuple[float, float]] = []
 
-    for r, c in right_candidates[: max(1, int(layout_samples))]:
-        p1 = by_rc.get((int(r), int(c)))
-        p2 = by_rc.get((int(r), int(c + 1)))
-        if not p1 or not p2:
-            continue
-        est = _estimate_pair_shift(str(p1), str(p2))
-        if est is None:
-            continue
-        right_vecs.append((float(est[0]), float(est[1])))
-
-    for r, c in down_candidates[: max(1, int(layout_samples))]:
-        p1 = by_rc.get((int(r), int(c)))
-        p2 = by_rc.get((int(r + 1), int(c)))
-        if not p1 or not p2:
-            continue
-        est = _estimate_pair_shift(str(p1), str(p2))
-        if est is None:
-            continue
-        dxdy = (float(est[0]), float(est[1]))
-        down_vecs.append(dxdy)
-        if (int(r) % 2) == 0:
-            down_vecs_even.append(dxdy)
-        else:
-            down_vecs_odd.append(dxdy)
+    for completed, (p1, p2, r, _c, direction) in enumerate(sampled_pairs, start=1):
+        if cancel_cb is not None:
+            cancel_cb()
+        est = _estimate_pair_shift(p1, p2)
+        if est is not None:
+            dxdy = (float(est[0]), float(est[1]))
+            if direction == "right":
+                right_vecs.append(dxdy)
+            else:
+                down_vecs.append(dxdy)
+                if (int(r) % 2) == 0:
+                    down_vecs_even.append(dxdy)
+                else:
+                    down_vecs_odd.append(dxdy)
+        if progress_cb is not None:
+            progress_cb(
+                "stitch-align",
+                "Aligning neighboring tiles",
+                completed,
+                len(sampled_pairs),
+                "pairs",
+            )
 
     v_col_x, v_col_y, n_col = _robust_center(right_vecs)
     v_row_x, v_row_y, n_row = _robust_center(down_vecs)
@@ -285,4 +299,3 @@ def estimate_step_vectors(
             }
         )
     return out
-

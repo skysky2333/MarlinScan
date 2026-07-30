@@ -1,16 +1,30 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import tempfile
 import time
 
+from ..progress import StepProgressTracker, format_step_progress
 from ..uvc import compute_sharpness, transform_frame
 from .io import imwrite, is_no_space_error
 from .params import ScanParams, fmt_duration as _fmt_duration
 from .stitch_outputs import stitch_scan_outputs
 
 
+def _write_json(path: str, payload: object) -> None:
+    temporary = f"{path}.tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
 def run_scan_worker(gui: object, params: ScanParams) -> None:
+    stitch_progress_tracker = StepProgressTracker()
+
     def ev(kind: str, payload: object) -> None:
         try:
             getattr(gui, "_events").put((kind, payload))
@@ -20,11 +34,33 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
     def status(msg: str) -> None:
         ev("scan-status", msg)
 
-    def stitch_progress(pct: float, msg: str) -> None:
-        ev("scan-stitch-progress", (float(pct), str(msg)))
+    def stitch_progress(phase: str, label: str, completed: int, total: int | None, unit: str) -> None:
+        current = stitch_progress_tracker.update(phase, label, completed, total, unit)
+        percent = 100.0 if total == 0 else 0.0 if total is None else completed / total * 100.0
+        ev("scan-stitch-progress", (percent, format_step_progress(current)))
 
     def finish(ok: bool, msg: str) -> None:
         ev("scan-finished", (bool(ok), str(msg)))
+
+    try:
+        x0 = float(params.x_min)
+        x1 = float(params.x_max)
+        y0 = float(params.y_min)
+        y1 = float(params.y_max)
+        step_x = float(params.step_x_mm)
+        step_y = float(params.step_y_mm)
+    except (TypeError, ValueError):
+        finish(False, "Invalid scan parameters: bounds and steps must be numbers.")
+        return
+    if not all(math.isfinite(value) for value in (x0, x1, y0, y1, step_x, step_y)):
+        finish(False, "Invalid scan parameters: bounds and steps must be finite.")
+        return
+    if x1 < x0 or y1 < y0:
+        finish(False, "Invalid scan parameters: minimum bounds must not exceed maximum bounds.")
+        return
+    if step_x <= 0 or step_y <= 0:
+        finish(False, "Invalid scan parameters: scan steps must be positive.")
+        return
 
     try:
         import cv2  # type: ignore
@@ -46,25 +82,19 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
         return
 
     ts = time.strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(os.path.expanduser(params.out_base_dir), f"scan_{ts}")
+    out_base_dir = os.path.expanduser(params.out_base_dir)
     try:
-        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(out_base_dir, exist_ok=True)
+        out_dir = tempfile.mkdtemp(prefix=f"scan_{ts}_", dir=out_base_dir)
     except Exception as exc:
         finish(False, f"Failed to create output dir: {exc}")
         return
 
     try:
-        with open(os.path.join(out_dir, "scan_params.json"), "w", encoding="utf-8") as f:
-            json.dump(params.__dict__, f, indent=2, sort_keys=True)
-    except Exception:
-        pass
-
-    x0 = float(params.x_min)
-    x1 = float(params.x_max)
-    y0 = float(params.y_min)
-    y1 = float(params.y_max)
-    step_x = float(params.step_x_mm)
-    step_y = float(params.step_y_mm)
+        _write_json(os.path.join(out_dir, "scan_params.json"), {**params.__dict__, "image_roles": "single"})
+    except Exception as exc:
+        finish(False, f"Scan failed: could not write scan_params.json: {exc}")
+        return
 
     xs: list[float] = []
     v = float(x0)
@@ -125,11 +155,28 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
         if not ok:
             raise RuntimeError(f"G-code failed: {cmd}")
 
-    # Ensure absolute XY for scan moves.
     try:
         gcode_wait("G90", timeout_s=5.0, tag_prefix="scan_g90")
-    except Exception:
-        pass
+    except Exception as exc:
+        finish(False, f"Scan failed: {exc}")
+        return
+
+    def restore_scan_state() -> None:
+        try:
+            if restore_coord == "relative":
+                gcode_wait("G91", timeout_s=3.0, tag_prefix="scan_restore_g91")
+            else:
+                gcode_wait("G90", timeout_s=3.0, tag_prefix="scan_restore_g90")
+        except Exception:
+            pass
+        try:
+            getattr(gui, "_cam_af_stop").clear()
+        except Exception:
+            pass
+
+    def require_not_stopped() -> None:
+        if getattr(gui, "_scan_stop").is_set():
+            raise InterruptedError("stopped")
 
     with getattr(gui, "_cam_frame_cond"):
         last_seq = int(getattr(gui, "_cam_frame_seq"))
@@ -316,55 +363,44 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
         z11 = float(mesh_z[j + 1][i + 1])
         return float(((1.0 - tx) * (1.0 - ty) * z00) + (tx * (1.0 - ty) * z10) + ((1.0 - tx) * ty * z01) + (tx * ty * z11))
 
-    if params.focus_plane:
-        mx = max(2, int(params.mesh_nx))
-        my = max(2, int(params.mesh_ny))
+    try:
+        if params.focus_plane:
+            mx = max(2, int(params.mesh_nx))
+            my = max(2, int(params.mesh_ny))
 
-        status(f"Scan: focus-mesh calibration ({mx}×{my})…")
+            status(f"Scan: focus-mesh calibration ({mx}×{my})…")
 
-        def _linspace(a: float, b: float, n: int) -> list[float]:
-            if n <= 1:
-                return [float((float(a) + float(b)) * 0.5)]
-            step = (float(b) - float(a)) / float(n - 1)
-            return [float(float(a) + (float(i) * float(step))) for i in range(int(n))]
+            def _linspace(a: float, b: float, n: int) -> list[float]:
+                if n <= 1:
+                    return [float((float(a) + float(b)) * 0.5)]
+                step = (float(b) - float(a)) / float(n - 1)
+                return [float(float(a) + (float(i) * float(step))) for i in range(int(n))]
 
-        mesh_xs = _linspace(float(x0), float(x1), int(mx))
-        mesh_ys = _linspace(float(y0), float(y1), int(my))
-        mesh_z_opt: list[list[float | None]] = [[None for _ in range(int(mx))] for _ in range(int(my))]
+            mesh_xs = _linspace(float(x0), float(x1), int(mx))
+            mesh_ys = _linspace(float(y0), float(y1), int(my))
+            mesh_z_opt: list[list[float | None]] = [[None for _ in range(int(mx))] for _ in range(int(my))]
 
-        pts_xyz: list[tuple[float, float, float]] = []
-        for j, yy in enumerate(mesh_ys):
-            cols = list(range(int(mx)))
-            if params.serpentine and (j % 2 == 1):
-                cols.reverse()
-            for ii, i in enumerate(cols):
-                if getattr(gui, "_scan_stop").is_set():
-                    raise InterruptedError("stopped")
-                xx = float(mesh_xs[int(i)])
-                status(f"Scan: focus mesh ({j+1}/{my}) ({ii+1}/{mx})  X={xx:.2f} Y={yy:.2f}")
-                gcode_wait(f"G0 X{xx:g} Y{yy:g} F{feed_xy}", timeout_s=12.0, tag_prefix="scan_cal_xy")
-                gcode_wait("M400", timeout_s=300.0, tag_prefix="scan_cal_m400_xy")
-                if float(motion_settle_s) > 1e-6:
-                    time.sleep(float(motion_settle_s))
-                flush_frames(int(warmup_frames), timeout_s=1.2)
+            pts_xyz: list[tuple[float, float, float]] = []
+            for j, yy in enumerate(mesh_ys):
+                cols = list(range(int(mx)))
+                if params.serpentine and (j % 2 == 1):
+                    cols.reverse()
+                for ii, i in enumerate(cols):
+                    require_not_stopped()
+                    xx = float(mesh_xs[int(i)])
+                    status(f"Scan: focus mesh ({j+1}/{my}) ({ii+1}/{mx})  X={xx:.2f} Y={yy:.2f}")
+                    gcode_wait(f"G0 X{xx:g} Y{yy:g} F{feed_xy}", timeout_s=12.0, tag_prefix="scan_cal_xy")
+                    gcode_wait("M400", timeout_s=300.0, tag_prefix="scan_cal_m400_xy")
+                    if float(motion_settle_s) > 1e-6:
+                        time.sleep(float(motion_settle_s))
+                    flush_frames(int(warmup_frames), timeout_s=1.2)
 
-                try:
-                    getattr(gui, "_cam_af_stop").clear()
-                except Exception:
-                    pass
+                    try:
+                        getattr(gui, "_cam_af_stop").clear()
+                    except Exception:
+                        pass
 
-                # For calibration, use the same autofocus algorithm as the manual "Auto Focus" button.
-                ok_af, z_af, _f, _msg = getattr(gui, "_camera_autofocus_thread")(
-                    "absolute",
-                    float(z_min),
-                    float(z_max),
-                    float(speed_z),
-                    emit_events=False,
-                    profile="full",
-                    start_z_hint=(float(z_hint) if (z_hint is not None) else None),
-                )
-                if (not ok_af) or (z_af is None):
-                    status("Scan: focus mesh AF failed; retrying with fresh position…")
+                    # For calibration, use the same autofocus algorithm as the manual "Auto Focus" button.
                     ok_af, z_af, _f, _msg = getattr(gui, "_camera_autofocus_thread")(
                         "absolute",
                         float(z_min),
@@ -372,51 +408,62 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
                         float(speed_z),
                         emit_events=False,
                         profile="full",
-                        start_z_hint=None,
+                        start_z_hint=(float(z_hint) if (z_hint is not None) else None),
                     )
+                    if (not ok_af) or (z_af is None):
+                        status("Scan: focus mesh AF failed; retrying with fresh position…")
+                        ok_af, z_af, _f, _msg = getattr(gui, "_camera_autofocus_thread")(
+                            "absolute",
+                            float(z_min),
+                            float(z_max),
+                            float(speed_z),
+                            emit_events=False,
+                            profile="full",
+                            start_z_hint=None,
+                        )
 
-                if ok_af and z_af is not None:
-                    z_val = float(z_af)
-                    mesh_z_opt[int(j)][int(i)] = float(z_val)
-                    pts_xyz.append((float(xx), float(yy), float(z_val)))
-                    z_hint = float(z_val)
-                else:
-                    status("Scan: focus mesh AF failed (point left blank)")
+                    if ok_af and z_af is not None:
+                        z_val = float(z_af)
+                        mesh_z_opt[int(j)][int(i)] = float(z_val)
+                        pts_xyz.append((float(xx), float(yy), float(z_val)))
+                        z_hint = float(z_val)
+                    else:
+                        status("Scan: focus mesh AF failed (point left blank)")
 
-        # Fill missing mesh points with a best-fit plane (fallback), so interpolation is always defined.
-        plane: tuple[float, float, float] | None = None  # z = ax + by + c
-        if len(pts_xyz) >= 3:
-            try:
-                A = np.array([[x, y, 1.0] for (x, y, _z) in pts_xyz], dtype=np.float64)
-                b = np.array([z for (_x, _y, z) in pts_xyz], dtype=np.float64)
-                coeff, _res, _rank, _s = np.linalg.lstsq(A, b, rcond=None)
-                plane = (float(coeff[0]), float(coeff[1]), float(coeff[2]))
-            except Exception:
-                plane = None
+            # Fill missing mesh points with a best-fit plane (fallback), so interpolation is always defined.
+            plane: tuple[float, float, float] | None = None  # z = ax + by + c
+            if len(pts_xyz) >= 3:
+                try:
+                    A = np.array([[x, y, 1.0] for (x, y, _z) in pts_xyz], dtype=np.float64)
+                    b = np.array([z for (_x, _y, z) in pts_xyz], dtype=np.float64)
+                    coeff, _res, _rank, _s = np.linalg.lstsq(A, b, rcond=None)
+                    plane = (float(coeff[0]), float(coeff[1]), float(coeff[2]))
+                except Exception:
+                    plane = None
 
-        if plane is None and pts_xyz:
-            # Fallback to the last known Z.
-            try:
-                last_z = float(pts_xyz[-1][2])
-            except Exception:
-                last_z = 0.0
-            plane = (0.0, 0.0, float(last_z))
+            if plane is None and pts_xyz:
+                # Fallback to the last known Z.
+                try:
+                    last_z = float(pts_xyz[-1][2])
+                except Exception:
+                    last_z = 0.0
+                plane = (0.0, 0.0, float(last_z))
 
-        if plane is not None:
-            a, b2, c = plane
-            mesh_z = []
-            for j, yy in enumerate(mesh_ys):
-                row: list[float] = []
-                for i, xx in enumerate(mesh_xs):
-                    z0 = mesh_z_opt[int(j)][int(i)]
-                    if z0 is None:
-                        z0 = (float(a) * float(xx)) + (float(b2) * float(yy)) + float(c)
-                    row.append(float(z0))
-                mesh_z.append(row)
+            if plane is not None:
+                a, b2, c = plane
+                mesh_z = []
+                for j, yy in enumerate(mesh_ys):
+                    row: list[float] = []
+                    for i, xx in enumerate(mesh_xs):
+                        z0 = mesh_z_opt[int(j)][int(i)]
+                        if z0 is None:
+                            z0 = (float(a) * float(xx)) + (float(b2) * float(yy)) + float(c)
+                        row.append(float(z0))
+                    mesh_z.append(row)
 
-            try:
-                with open(os.path.join(out_dir, "focus_mesh.json"), "w", encoding="utf-8") as f:
-                    json.dump(
+                try:
+                    _write_json(
+                        os.path.join(out_dir, "focus_mesh.json"),
                         {
                             "mesh_nx": int(mx),
                             "mesh_ny": int(my),
@@ -425,17 +472,13 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
                             "z_mm": [[float(v) for v in row] for row in mesh_z],
                             "plane_fallback": {"a": float(a), "b": float(b2), "c": float(c)},
                         },
-                        f,
-                        indent=2,
-                        sort_keys=True,
                     )
-            except Exception:
-                pass
-            status(f"Scan: focus mesh ready ({mx}×{my})")
-        else:
-            status("Scan: focus mesh calibration failed (need ≥3 good points); continuing without mesh")
+                except Exception as exc:
+                    raise RuntimeError(f"could not write focus_mesh.json: {exc}") from exc
+                status(f"Scan: focus mesh ready ({mx}×{my})")
+            else:
+                status("Scan: focus mesh calibration failed (need ≥3 good points); continuing without mesh")
 
-    try:
         for r, y in enumerate(ys):
             if getattr(gui, "_scan_stop").is_set():
                 raise InterruptedError("stopped")
@@ -571,22 +614,27 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
                 tiles.append({"row": int(r), "col": int(col), "x_mm": float(x), "y_mm": float(y), "file": filename})
 
         try:
-            with open(os.path.join(out_dir, "tiles.json"), "w", encoding="utf-8") as f:
-                json.dump(tiles, f, indent=2, sort_keys=False)
-        except Exception:
-            pass
+            _write_json(os.path.join(out_dir, "tiles.json"), tiles)
+        except Exception as exc:
+            raise RuntimeError(f"could not write tiles.json: {exc}") from exc
 
         if bool(params.build_pyramidal_tiff) and tiles:
             stitch_ok = True
             status("Scan: stitching (this can take a while)…")
             try:
+                require_not_stopped()
                 stitch_scan_outputs(
                     tiles=tiles,
                     out_dir=out_dir,
                     build_pyramidal_tiff=bool(params.build_pyramidal_tiff),
                     tiff_compression=str(params.tiff_compression),
+                    image_roles="single",
                     progress_cb=stitch_progress,
+                    cancel_cb=require_not_stopped,
                 )
+                require_not_stopped()
+            except InterruptedError:
+                raise
             except Exception as exc:
                 stitch_ok = False
                 try:
@@ -604,6 +652,7 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
             else:
                 status("Scan: stitching failed (you can restitch later).")
 
+        require_not_stopped()
         if bool(params.build_pyramidal_tiff) and tiles and not stitch_ok:
             finish(
                 True,
@@ -619,14 +668,4 @@ def run_scan_worker(gui: object, params: ScanParams) -> None:
         finish(False, f"Scan failed: {exc}")
         return
     finally:
-        try:
-            if restore_coord == "relative":
-                gcode_wait("G91", timeout_s=3.0, tag_prefix="scan_restore_g91")
-            else:
-                gcode_wait("G90", timeout_s=3.0, tag_prefix="scan_restore_g90")
-        except Exception:
-            pass
-        try:
-            getattr(gui, "_cam_af_stop").clear()
-        except Exception:
-            pass
+        restore_scan_state()

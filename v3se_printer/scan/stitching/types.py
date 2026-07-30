@@ -7,7 +7,8 @@ from dataclasses import dataclass
 class Entry:
     row: int
     col: int
-    path: str
+    alignment_path: str
+    composite_path: str
 
 
 @dataclass(frozen=True)
@@ -18,4 +19,3 @@ class LayoutMosaic:
     memmap_path: str | None
     weights_memmap_path: str | None
     stage_meta: dict[str, object]
-

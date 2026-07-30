@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MarlinScan</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#camera-stage">Skip to camera and motion</a>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">MS</span>
+      <div><strong>MarlinScan</strong><span>Capture workstation</span></div>
+    </div>
+    <div class="run-status" role="status" aria-live="polite">
+      <span class="state-dot" id="state-dot"></span>
+      <div>
+        <strong id="system-state">Connecting</strong>
+        <span id="system-message">Waiting for service</span>
+        <span id="step-progress-line">No active step · 0 units · ETA unavailable</span>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button class="button secondary" id="stop-operation" type="button" disabled>Cancel</button>
+      <button class="button danger" id="emergency-stop" type="button" disabled>Emergency stop</button>
+    </div>
+    <progress id="operation-progress" max="1" value="0" aria-label="Operation progress"></progress>
+  </header>
+
+  <nav class="workspace-switcher" role="tablist" aria-label="Application workspace">
+    <button class="workspace-tab active" id="capture-workspace-tab" type="button" role="tab" aria-controls="capture-workspace" aria-selected="true" data-workspace="capture">Capture</button>
+    <button class="workspace-tab" id="editor-workspace-tab" type="button" role="tab" aria-controls="editor-workspace" aria-selected="false" data-workspace="editor">Editor</button>
+  </nav>
+
+  <div class="notice" id="notice" role="alert" hidden>
+    <span id="notice-text"></span>
+    <button class="icon-button" id="dismiss-notice" type="button" aria-label="Dismiss message" title="Dismiss">&times;</button>
+  </div>
+
+  <div class="workspace" id="capture-workspace" role="tabpanel" aria-labelledby="capture-workspace-tab">
+    <aside class="hardware-panel panel" aria-labelledby="hardware-title">
+      <div class="panel-heading">
+        <div><p class="eyebrow">Setup</p><h1 id="hardware-title">Hardware</h1></div>
+        <button class="icon-button" id="refresh-ports" type="button" aria-label="Refresh serial ports" title="Refresh serial ports">&#8635;</button>
+      </div>
+
+      <section class="device-section" aria-labelledby="printer-title">
+        <div class="section-heading">
+          <h2 id="printer-title">Motion stage</h2>
+          <span class="device-state" id="printer-state">Disconnected</span>
+        </div>
+        <form id="printer-form">
+          <label class="field wide"><span>Serial port</span><select id="printer-port" required><option value="">No ports found</option></select></label>
+          <div class="field-row">
+            <label class="field"><span>Baud</span><select id="printer-baud"><option>115200</option><option>250000</option><option>230400</option><option>57600</option></select></label>
+            <label class="field"><span>Line ending</span><select id="printer-eol"><option value="crlf">CRLF</option><option value="lf">LF</option></select></label>
+          </div>
+          <div class="button-row">
+            <button class="button primary grow" id="printer-connect" type="submit">Connect</button>
+            <button class="button secondary grow" id="printer-disconnect" type="button" disabled>Disconnect</button>
+          </div>
+        </form>
+        <div class="initialization" id="initialization-state">
+          <span class="initialization-mark" aria-hidden="true">!</span>
+          <div><strong>Coordinates required</strong><span>Initialize after every connection.</span></div>
+        </div>
+        <div class="initialization-actions">
+          <button class="button secondary grow" id="printer-home" type="button" disabled>Home</button>
+          <button class="button secondary grow" id="printer-origin" type="button" disabled>Set origin</button>
+          <button class="button secondary wide" id="printer-restore" type="button" disabled>Restore saved position</button>
+        </div>
+        <dl class="device-details">
+          <div><dt>Firmware</dt><dd id="printer-firmware">-</dd></div>
+          <div><dt>Machine</dt><dd id="printer-machine">-</dd></div>
+        </dl>
+      </section>
+
+      <section class="device-section" aria-labelledby="camera-title">
+        <div class="section-heading">
+          <h2 id="camera-title">Nikon 1 J4</h2>
+          <span class="device-state" id="camera-state">Disconnected</span>
+        </div>
+        <div class="camera-actions">
+          <button class="button primary" id="camera-control" type="button">Take control</button>
+          <div class="button-row">
+            <button class="button secondary grow" id="camera-connect" type="button" disabled>Connect</button>
+            <button class="button secondary grow" id="camera-disconnect" type="button" disabled>Disconnect</button>
+          </div>
+        </div>
+        <form class="test-capture" id="camera-test-form">
+          <div class="field-row camera-settings">
+            <label class="field"><span>ISO</span><select id="camera-iso" disabled><option value="">-</option></select></label>
+            <label class="field"><span>Shutter</span><select id="test-shutter" required disabled><option value="">Select shutter</option></select></label>
+          </div>
+          <label class="field wide"><span>Capture folder</span><input id="test-output" type="text" value="./output/test-captures" required></label>
+          <button class="button secondary wide" id="camera-test" type="submit" disabled>Take test photo</button>
+        </form>
+        <dl class="device-details">
+          <div><dt>Quality</dt><dd id="camera-quality">-</dd></div>
+          <div><dt>Configured profile</dt><dd id="camera-configured-profile">-</dd></div>
+          <div><dt>Latest capture</dt><dd id="camera-latest-profile">-</dd></div>
+          <div><dt>Shutter</dt><dd id="camera-shutter">-</dd></div>
+        </dl>
+      </section>
+    </aside>
+
+    <main class="stage-panel panel" id="camera-stage">
+      <div class="stage-toolbar">
+        <div><p class="eyebrow">Capture</p><h1>Camera and position</h1></div>
+        <div class="roi-controls" aria-label="Region selection mode">
+          <div class="segmented" role="tablist" aria-label="Image region">
+            <button class="segment active exposure" type="button" role="tab" aria-selected="true" data-roi-mode="exposure">Exposure</button>
+            <button class="segment focus" type="button" role="tab" aria-selected="false" data-roi-mode="focus">Focus</button>
+            <button class="segment gray" type="button" role="tab" aria-selected="false" data-roi-mode="gray">Gray</button>
+          </div>
+          <button class="button quiet" id="reset-roi" type="button">Reset ROI</button>
+        </div>
+      </div>
+
+      <section class="camera-view" aria-labelledby="latest-capture-title">
+        <div class="view-label">
+          <h2 id="latest-capture-title">Latest capture</h2>
+          <span id="capture-file">No capture</span>
+        </div>
+        <div class="canvas-frame">
+          <canvas id="capture-canvas" width="960" height="640" tabindex="0" aria-label="Latest Nikon capture with selectable calibration regions"></canvas>
+          <div class="empty-capture" id="empty-capture"><strong>No image yet</strong><span>Take a test photo to inspect the frame.</span></div>
+        </div>
+        <div class="roi-readout">
+          <span class="roi-swatch exposure" id="roi-swatch"></span>
+          <strong id="roi-name">Exposure ROI</strong>
+          <output id="roi-value">x 20% &nbsp; y 20% &nbsp; w 60% &nbsp; h 60%</output>
+        </div>
+        <div class="exposure-analysis">
+          <section class="loupe-view" aria-labelledby="loupe-title">
+            <div class="analysis-heading"><h3 id="loupe-title">Center loupe</h3><span>10x</span></div>
+            <canvas id="loupe-canvas" width="480" height="320" aria-label="No center loupe available"></canvas>
+          </section>
+          <section class="waveform-view" aria-labelledby="waveform-title">
+            <div class="analysis-heading"><h3 id="waveform-title">Luma waveform</h3><span>Exposure ROI</span></div>
+            <canvas id="waveform-canvas" width="512" height="104" aria-label="No exposure waveform available"></canvas>
+          </section>
+          <section class="exposure-meter" aria-labelledby="exposure-meter-title">
+            <div class="analysis-heading"><h3 id="exposure-meter-title">Exposure meter</h3><output id="exposure-state">No image</output></div>
+            <div class="meter-labels" aria-hidden="true"><span>-2</span><span>-1</span><span>0</span><span>+1</span><span>+2 EV</span></div>
+            <div class="meter-track" aria-hidden="true"><span class="meter-target"></span><span class="meter-marker" id="exposure-marker"></span></div>
+            <div class="meter-values"><strong id="exposure-ev">-</strong><span>Meter <output id="exposure-metered">-</output></span><span>P99 <output id="exposure-p99">-</output></span><span>JPEG clip <output id="exposure-clipped">-</output></span></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="motion-section" aria-labelledby="position-title">
+        <div class="motion-heading">
+          <div><h2 id="position-title">Position</h2><span id="position-line">X - &nbsp; Y - &nbsp; Z -</span></div>
+          <div class="manual-speeds">
+            <label class="speed-control" for="jog-speed-xy"><span>Jog XY</span><input id="jog-speed-xy" type="range" min="1" max="300" step="1" value="100"><output id="jog-speed-xy-value">100 mm/s</output></label>
+            <label class="speed-control" for="jog-speed-z"><span>Jog Z</span><input id="jog-speed-z" type="range" min="0.1" max="50" step="0.1" value="10"><output id="jog-speed-z-value">10 mm/s</output></label>
+          </div>
+        </div>
+        <div class="motion-grid">
+          <div class="bed-wrap">
+            <canvas id="bed-canvas" width="420" height="420" tabindex="0" aria-label="Printer bed target map, zero to 220 millimeters on X and Y"></canvas>
+            <div class="bed-legend">
+              <span class="current-dot"></span>Current
+              <span class="target-cross">+</span>Target
+              <span class="mesh-legend" id="mesh-legend" hidden><span class="mesh-scale" aria-hidden="true"></span><output id="mesh-range"></output></span>
+            </div>
+            <div class="scan-plan-summary">
+              <div class="scan-plan-legend" aria-hidden="true">
+                <span><i class="scan-key planned"></i>Planned</span>
+                <span><i class="scan-key completed"></i>Completed</span>
+                <span><i class="scan-key current"></i>Current</span>
+              </div>
+              <output id="scan-plan-readout">0 tiles · Adjust scan settings</output>
+            </div>
+          </div>
+          <div class="position-controls">
+            <form id="move-form">
+              <div class="coordinate-inputs">
+                <label class="field"><span>X (mm)</span><input id="move-x" type="number" min="0" max="220" step="0.01" value="110" required></label>
+                <label class="field"><span>Y (mm)</span><input id="move-y" type="number" min="0" max="220" step="0.01" value="110" required></label>
+                <label class="field"><span id="move-z-label">Z (mm)</span><input id="move-z" type="number" min="0" max="250" step="0.001" value="203" required></label>
+              </div>
+              <div class="move-options">
+                <label class="check-field"><input id="move-on-click" type="checkbox"><span>Move on bed click</span></label>
+              </div>
+              <button class="button primary wide" id="move-submit" type="submit" disabled>Move to target</button>
+            </form>
+            <div class="jog-area" aria-label="Hold to jog">
+              <div class="jog-pad">
+                <button class="jog-button" type="button" data-jog="0,1,0" aria-label="Jog positive Y"><span aria-hidden="true">&uarr;</span><kbd>W</kbd></button>
+                <button class="jog-button" type="button" data-jog="-1,0,0" aria-label="Jog negative X"><span aria-hidden="true">&larr;</span><kbd>A</kbd></button>
+                <button class="jog-button stop-jog" id="stop-jog" type="button" aria-label="Stop jogging" title="Stop jogging"><span aria-hidden="true">&#9632;</span></button>
+                <button class="jog-button" type="button" data-jog="1,0,0" aria-label="Jog positive X"><span aria-hidden="true">&rarr;</span><kbd>D</kbd></button>
+                <button class="jog-button" type="button" data-jog="0,-1,0" aria-label="Jog negative Y"><span aria-hidden="true">&darr;</span><kbd>S</kbd></button>
+              </div>
+              <div class="z-jog">
+                <button class="jog-button" type="button" data-jog="0,0,1">Z+</button>
+                <span>Z axis</span>
+                <button class="jog-button" type="button" data-jog="0,0,-1">Z-</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <aside class="workflow-panel panel" aria-labelledby="workflow-title">
+      <div class="panel-heading">
+        <div><p class="eyebrow">Workflow</p><h1 id="workflow-title">Scan job</h1></div>
+      </div>
+      <div class="workflow-tabs" role="tablist" aria-label="Scan workflow">
+        <button class="workflow-tab active" id="calibration-tab" type="button" role="tab" aria-controls="calibration-panel" aria-selected="true" data-panel="calibration-panel">Calibrate</button>
+        <button class="workflow-tab" id="scan-tab" type="button" role="tab" aria-controls="scan-panel" aria-selected="false" data-panel="scan-panel">Scan</button>
+        <button class="workflow-tab" id="results-tab" type="button" role="tab" aria-controls="results-panel" aria-selected="false" data-panel="results-panel">Results</button>
+      </div>
+
+      <section class="measurement-section" aria-labelledby="measurement-title">
+        <div class="measurement-heading"><h2 id="measurement-title">Measurements</h2><span>Current and past</span></div>
+        <ol class="measurement-log" id="measurement-log" aria-live="polite">
+          <li class="measurement-empty">No measurements yet.</li>
+        </ol>
+      </section>
+
+      <section class="workflow-content" id="calibration-panel" role="tabpanel" aria-labelledby="calibration-tab">
+        <form id="calibration-form">
+          <fieldset class="control-group">
+            <legend>Scan bounds</legend>
+            <div class="form-grid four">
+              <div class="field bound-field"><div class="bound-heading"><label for="cal-x-min">X min</label><button type="button" data-current-bound="x-min" data-axis="x" aria-label="Set X minimum to current X position" disabled>Use current</button></div><input id="cal-x-min" data-coverage-bound="x-min" type="number" min="0" max="220" step="0.01" value="15" required></div>
+              <div class="field bound-field"><div class="bound-heading"><label for="cal-x-max">X max</label><button type="button" data-current-bound="x-max" data-axis="x" aria-label="Set X maximum to current X position" disabled>Use current</button></div><input id="cal-x-max" data-coverage-bound="x-max" type="number" min="0" max="220" step="0.01" value="205" required></div>
+              <div class="field bound-field"><div class="bound-heading"><label for="cal-y-min">Y min</label><button type="button" data-current-bound="y-min" data-axis="y" aria-label="Set Y minimum to current Y position" disabled>Use current</button></div><input id="cal-y-min" data-coverage-bound="y-min" type="number" min="0" max="220" step="0.01" value="25" required></div>
+              <div class="field bound-field"><div class="bound-heading"><label for="cal-y-max">Y max</label><button type="button" data-current-bound="y-max" data-axis="y" aria-label="Set Y maximum to current Y position" disabled>Use current</button></div><input id="cal-y-max" data-coverage-bound="y-max" type="number" min="0" max="220" step="0.01" value="205" required></div>
+            </div>
+          </fieldset>
+          <fieldset class="control-group">
+            <legend>Auto exposure</legend>
+            <button class="button secondary wide calibration-action" id="auto-exposure" type="button" disabled>Auto exposure</button>
+          </fieldset>
+          <fieldset class="control-group">
+            <legend>Focus calibration</legend>
+            <p class="control-description">Single autofocus measures the current position and assumes one flat Z plane across the scan bounds. Grid autofocus measures four quarter-area points plus the center and fits a varying surface.</p>
+            <div class="form-grid two">
+              <label class="field"><span>XY speed</span><input id="cal-speed-xy" type="number" min="0.1" max="300" step="0.1" value="200" required></label>
+              <label class="field"><span>Z speed</span><input id="cal-speed-z" type="number" min="0.1" max="50" step="0.1" value="10" required></label>
+            </div>
+            <button class="button secondary wide calibration-action" id="auto-focus" type="button" disabled>Single autofocus</button>
+            <button class="button secondary wide calibration-action" id="focus-grid" type="button" disabled>Grid autofocus</button>
+          </fieldset>
+          <fieldset class="control-group">
+            <legend>Gray white balance</legend>
+            <button class="button secondary wide calibration-action" id="gray-white-balance" type="button" disabled>Calibrate gray white balance</button>
+          </fieldset>
+          <label class="field wide output-field"><span>Calibration folder</span><input id="cal-output" type="text" value="./output/calibration" required></label>
+          <p class="control-description">Runs auto exposure, five-point grid autofocus, and gray white balance.</p>
+          <button class="button primary wide action-button" id="start-calibration" type="submit" disabled>Run all calibration</button>
+        </form>
+      </section>
+
+      <section class="workflow-content" id="scan-panel" role="tabpanel" aria-labelledby="scan-tab" hidden>
+        <form id="scan-form">
+          <fieldset class="control-group">
+            <legend>Scan bounds</legend>
+            <div class="form-grid four">
+              <div class="field bound-field"><div class="bound-heading"><label for="scan-x-min">X min</label><button type="button" data-current-bound="x-min" data-axis="x" aria-label="Set X minimum to current X position" disabled>Use current</button></div><input id="scan-x-min" data-coverage-bound="x-min" type="number" min="0" max="220" step="0.01" value="15" required></div>
+              <div class="field bound-field"><div class="bound-heading"><label for="scan-x-max">X max</label><button type="button" data-current-bound="x-max" data-axis="x" aria-label="Set X maximum to current X position" disabled>Use current</button></div><input id="scan-x-max" data-coverage-bound="x-max" type="number" min="0" max="220" step="0.01" value="205" required></div>
+              <div class="field bound-field"><div class="bound-heading"><label for="scan-y-min">Y min</label><button type="button" data-current-bound="y-min" data-axis="y" aria-label="Set Y minimum to current Y position" disabled>Use current</button></div><input id="scan-y-min" data-coverage-bound="y-min" type="number" min="0" max="220" step="0.01" value="25" required></div>
+              <div class="field bound-field"><div class="bound-heading"><label for="scan-y-max">Y max</label><button type="button" data-current-bound="y-max" data-axis="y" aria-label="Set Y maximum to current Y position" disabled>Use current</button></div><input id="scan-y-max" data-coverage-bound="y-max" type="number" min="0" max="220" step="0.01" value="205" required></div>
+            </div>
+          </fieldset>
+          <fieldset class="control-group">
+            <legend>Camera footprint</legend>
+            <div class="form-grid two">
+              <label class="field"><span>Frame width</span><input id="scan-frame-width" type="number" min="0.01" max="500" step="0.01" value="25" required></label>
+              <label class="field"><span>Frame height</span><input id="scan-frame-height" type="number" min="0.01" max="500" step="0.01" value="17" required></label>
+              <label class="field"><span>Overlap (%)</span><input id="scan-overlap" type="number" min="0.1" max="89.9" step="0.1" value="25" required></label>
+              <label class="field"><span>Settle (ms)</span><input id="scan-settle" type="number" min="0" max="5000" step="1" value="250" required></label>
+              <label class="check-field span-two"><input id="scan-quick-acquisition" type="checkbox"><span>Quick acquisition: capture to the camera card, then import all tiles</span></label>
+            </div>
+            <div class="capture-density">
+              <span>Estimated capture density</span>
+              <output id="scan-estimated-dpi" aria-live="polite">Take a capture to estimate DPI</output>
+            </div>
+            <p class="control-description">Quick acquisition shortens the moving phase. Tile images appear during the import phase instead of after each capture.</p>
+          </fieldset>
+          <fieldset class="control-group">
+            <legend>Motion</legend>
+            <div class="form-grid two">
+              <label class="field"><span>XY speed</span><input id="scan-speed-xy" type="number" min="0.1" max="300" step="0.1" value="200" required></label>
+              <label class="field"><span>Z speed</span><input id="scan-speed-z" type="number" min="0.1" max="50" step="0.1" value="10" required></label>
+            </div>
+          </fieldset>
+          <label class="field wide output-field"><span>Scan folder</span><input id="scan-output" type="text" value="./output/scans" required></label>
+          <button class="button primary wide action-button" id="start-scan" type="submit" disabled>Start scan</button>
+        </form>
+      </section>
+
+      <section class="workflow-content results" id="results-panel" role="tabpanel" aria-labelledby="results-tab" hidden>
+        <div class="result-state" id="result-state">
+          <span class="result-mark" aria-hidden="true">-</span>
+          <div><strong>No completed work</strong><span>Calibration and scan outputs will appear here.</span></div>
+        </div>
+        <section class="result-section" aria-labelledby="calibration-result-title">
+          <h2 id="calibration-result-title">Calibration</h2>
+          <dl class="result-list">
+            <div><dt>ISO</dt><dd id="result-iso">-</dd></div>
+            <div><dt>Shutter</dt><dd id="result-shutter">-</dd></div>
+            <div><dt>Exposure reading</dt><dd id="result-exposure">-</dd></div>
+            <div><dt>Focus surface</dt><dd id="result-focus">-</dd></div>
+            <div class="path-result"><dt>Focus folder</dt><dd id="result-focus-dir">-</dd></div>
+            <div><dt>White balance</dt><dd id="result-wb">-</dd></div>
+            <div class="path-result"><dt>Calibration folder</dt><dd id="result-calibration-dir">-</dd></div>
+          </dl>
+        </section>
+        <section class="result-section" aria-labelledby="quick-calibration-result-title">
+          <h2 id="quick-calibration-result-title">Quick calibration</h2>
+          <dl class="result-list">
+            <div><dt>Auto exposure</dt><dd id="result-quick-exposure">-</dd></div>
+            <div><dt>Single autofocus</dt><dd id="result-quick-focus">-</dd></div>
+            <div><dt>Gray white balance</dt><dd id="result-quick-wb">-</dd></div>
+          </dl>
+        </section>
+        <section class="result-section" aria-labelledby="scan-result-title">
+          <h2 id="scan-result-title">Latest scan</h2>
+          <div class="result-preview" aria-live="polite">
+            <img id="result-preview" alt="Latest stitched scan preview" hidden>
+            <div class="result-preview-empty" id="result-preview-empty"><strong>No scan preview</strong><span>A completed mosaic will appear here.</span></div>
+          </div>
+          <ul class="result-files" id="result-files" aria-label="Available scan files" hidden></ul>
+          <dl class="result-list"><div class="path-result"><dt>Folder</dt><dd id="result-scan-dir">-</dd></div></dl>
+        </section>
+      </section>
+    </aside>
+  </div>
+
+  <main class="editor-workspace" id="editor-workspace" role="tabpanel" aria-labelledby="editor-workspace-tab" hidden>
+    <aside class="editor-project-pane">
+      <div class="editor-heading">
+        <div><p class="eyebrow">Project</p><h1>Completed scans</h1></div>
+        <button class="icon-button" id="editor-refresh-projects" type="button" aria-label="Refresh scan projects" title="Refresh scan projects">&#8635;</button>
+      </div>
+      <label class="field wide"><span>Scan project</span><select id="editor-project" disabled><option value="">No completed scans</option></select></label>
+      <dl class="editor-project-details">
+        <div><dt>Source tiles</dt><dd id="editor-project-tiles">-</dd></div>
+        <div><dt>Revisions</dt><dd id="editor-project-revisions">-</dd></div>
+        <div class="path-result"><dt>Folder</dt><dd id="editor-project-directory">-</dd></div>
+      </dl>
+      <div class="editor-result" id="editor-result" hidden>
+        <strong id="editor-result-revision"></strong>
+        <span id="editor-result-directory"></span>
+        <ul class="editor-result-files" id="editor-result-files" aria-label="Editor revision files"></ul>
+      </div>
+    </aside>
+
+    <section class="editor-preview-pane" id="editor-preview" aria-labelledby="editor-preview-title">
+      <div class="editor-preview-toolbar">
+        <div><p class="eyebrow">Preview</p><h1 id="editor-preview-title">No project selected</h1></div>
+        <div class="editor-preview-source">
+          <div class="segmented" role="tablist" aria-label="Editor preview source">
+            <button class="segment active" type="button" role="tab" aria-selected="true" data-editor-source="mosaic">Full image</button>
+            <button class="segment" type="button" role="tab" aria-selected="false" data-editor-source="tile">Local RAW</button>
+          </div>
+          <label class="field editor-tile-field" id="editor-tile-field" hidden><span>Source tile</span><select id="editor-tile"></select></label>
+        </div>
+      </div>
+      <div class="editor-image-frame">
+        <img id="editor-preview-image" alt="Edited scan preview" hidden>
+        <div class="editor-preview-empty" id="editor-preview-empty"><strong>No scan loaded</strong><span>Select a completed scan project.</span></div>
+      </div>
+      <div class="editor-preview-status" role="status" aria-live="polite">
+        <span id="editor-preview-source-label">Full image</span>
+        <span id="editor-preview-state">Original preview</span>
+      </div>
+    </section>
+
+    <aside class="editor-controls-pane" aria-labelledby="editor-controls-title">
+      <div class="editor-heading"><div><p class="eyebrow">Develop</p><h1 id="editor-controls-title">Global adjustments</h1></div></div>
+      <div class="editor-material segmented" role="tablist" aria-label="Film material">
+        <button class="segment active" type="button" role="tab" aria-selected="true" data-editor-material="positive">Positive</button>
+        <button class="segment" type="button" role="tab" aria-selected="false" data-editor-material="negative">Negative</button>
+      </div>
+      <div class="editor-control-tabs" role="tablist" aria-label="Editor controls">
+        <button class="editor-control-tab active" id="editor-basic-tab" type="button" role="tab" aria-controls="editor-basic-controls" aria-selected="true" data-editor-controls="editor-basic-controls">Basic</button>
+        <button class="editor-control-tab" id="editor-advanced-tab" type="button" role="tab" aria-controls="editor-advanced-controls" aria-selected="false" data-editor-controls="editor-advanced-controls">Advanced</button>
+      </div>
+      <form id="editor-form">
+        <section class="editor-control-panel" id="editor-basic-controls" role="tabpanel" aria-labelledby="editor-basic-tab">
+          <label class="editor-control"><span>Exposure</span><input id="editor-exposure-ev" data-editor-field="exposure_ev" type="range" min="-8" max="8" step="0.1" value="0"><output for="editor-exposure-ev">0.0 EV</output></label>
+          <label class="editor-control"><span>Temperature</span><input id="editor-temperature" data-editor-field="temperature" type="range" min="-1" max="1" step="0.01" value="0"><output for="editor-temperature">0.00</output></label>
+          <label class="editor-control"><span>Tint</span><input id="editor-tint" data-editor-field="tint" type="range" min="-1" max="1" step="0.01" value="0"><output for="editor-tint">0.00</output></label>
+          <label class="editor-control"><span>Contrast</span><input id="editor-contrast" data-editor-field="contrast" type="range" min="-1" max="1" step="0.01" value="0"><output for="editor-contrast">0.00</output></label>
+          <label class="editor-control"><span>Highlights</span><input id="editor-highlights" data-editor-field="highlights" type="range" min="-1" max="1" step="0.01" value="0"><output for="editor-highlights">0.00</output></label>
+          <label class="editor-control"><span>Shadows</span><input id="editor-shadows" data-editor-field="shadows" type="range" min="-1" max="1" step="0.01" value="0"><output for="editor-shadows">0.00</output></label>
+          <label class="editor-control"><span>Black point</span><input id="editor-black-point" data-editor-field="black_point" type="range" min="-1" max="0.95" step="0.01" value="0"><output for="editor-black-point">0.00</output></label>
+          <label class="editor-control"><span>White point</span><input id="editor-white-point" data-editor-field="white_point" type="range" min="0.01" max="8" step="0.01" value="1"><output for="editor-white-point">1.00</output></label>
+          <label class="editor-control"><span>Saturation</span><input id="editor-saturation" data-editor-field="saturation" type="range" min="0" max="3" step="0.01" value="1"><output for="editor-saturation">1.00</output></label>
+        </section>
+        <section class="editor-control-panel" id="editor-advanced-controls" role="tabpanel" aria-labelledby="editor-advanced-tab" hidden>
+          <fieldset class="editor-control-group">
+            <legend>Channel balance</legend>
+            <label class="editor-control"><span>Red</span><input id="editor-red-balance" data-editor-field="red_balance" type="range" min="0.1" max="4" step="0.01" value="1"><output for="editor-red-balance">1.00</output></label>
+            <label class="editor-control"><span>Green</span><input id="editor-green-balance" data-editor-field="green_balance" type="range" min="0.1" max="4" step="0.01" value="1"><output for="editor-green-balance">1.00</output></label>
+            <label class="editor-control"><span>Blue</span><input id="editor-blue-balance" data-editor-field="blue_balance" type="range" min="0.1" max="4" step="0.01" value="1"><output for="editor-blue-balance">1.00</output></label>
+          </fieldset>
+          <fieldset class="editor-control-group" id="editor-film-controls" hidden>
+            <legend>Negative film</legend>
+            <label class="editor-control"><span>Base red</span><input id="editor-film-base-red" data-editor-field="film_base_red" type="range" min="0.01" max="4" step="0.01" value="1"><output for="editor-film-base-red">1.00</output></label>
+            <label class="editor-control"><span>Base green</span><input id="editor-film-base-green" data-editor-field="film_base_green" type="range" min="0.01" max="4" step="0.01" value="1"><output for="editor-film-base-green">1.00</output></label>
+            <label class="editor-control"><span>Base blue</span><input id="editor-film-base-blue" data-editor-field="film_base_blue" type="range" min="0.01" max="4" step="0.01" value="1"><output for="editor-film-base-blue">1.00</output></label>
+            <label class="editor-control"><span>Density</span><input id="editor-film-density" data-editor-field="film_density" type="range" min="0.1" max="4" step="0.01" value="1"><output for="editor-film-density">1.00</output></label>
+          </fieldset>
+        </section>
+        <div class="editor-actions">
+          <button class="button quiet" id="editor-reset" type="button">Reset</button>
+          <button class="button secondary" id="editor-preview-button" type="button" disabled>Preview</button>
+          <button class="button primary" id="editor-apply" type="submit" disabled>Apply to all RAW</button>
+        </div>
+      </form>
+    </aside>
+  </main>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

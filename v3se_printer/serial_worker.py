@@ -33,7 +33,7 @@ class SerialWorker:
 
         self._tx_high: queue.Queue[GCodeJob] = queue.Queue()
         self._tx_low: queue.Queue[GCodeJob] = queue.Queue()
-        self._tx_immediate: queue.Queue[str] = queue.Queue()
+        self._tx_immediate: queue.Queue[tuple[str, threading.Event | None]] = queue.Queue()
 
         # Events: ("line", (text, show)), ("job_done", (...)), ("job_slow", (...)), ("error", msg)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -43,10 +43,7 @@ class SerialWorker:
 
     def close(self) -> None:
         self._stop_event.set()
-        try:
-            self._ser.close()
-        except Exception:
-            pass
+        self._ser.close()
 
     def clear_queues(self) -> None:
         try:
@@ -92,12 +89,13 @@ class SerialWorker:
             self._tx_low.put(job)
         return True
 
-    def send_immediate(self, command: str) -> bool:
+    def send_immediate(self, command: str, *, wait_for_write: bool = False, timeout_s: float = 2.0) -> bool:
         cmd = command.strip()
         if not cmd:
             return False
-        self._tx_immediate.put(cmd)
-        return True
+        written = threading.Event() if wait_for_write else None
+        self._tx_immediate.put((cmd, written))
+        return True if written is None else written.wait(timeout_s)
 
     def _io_loop(self) -> None:
         active: GCodeJob | None = None
@@ -110,13 +108,15 @@ class SerialWorker:
                 # Out-of-band commands (e.g., M112). These may interrupt normal responses.
                 try:
                     while True:
-                        cmd = self._tx_immediate.get_nowait()
+                        cmd, written = self._tx_immediate.get_nowait()
                         try:
                             self._ser.write((cmd + self._eol).encode("ascii", errors="ignore"))
                             self._ser.flush()
                         except serial.SerialException as exc:
                             self.events.put(("error", f"write failed: {exc}"))
                             break
+                        if written is not None:
+                            written.set()
                         self.events.put(("line", (f"> {cmd}", True)))
                 except queue.Empty:
                     pass

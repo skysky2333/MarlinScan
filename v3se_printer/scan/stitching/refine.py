@@ -4,6 +4,7 @@ import gc
 import math
 from typing import Any, Callable
 
+from ...progress import ProgressCallback
 from .types import Entry
 from .util import scale_for_megapix
 
@@ -24,9 +25,8 @@ def refine_positions_and_gains(
     scale_final: float,
     step_meta: dict[str, object],
     settings: dict[str, object],
-    progress_cb: Callable[[float, str], None] | None,
-    progress_base: float = 7.0,
-    progress_span: float = 2.0,
+    progress_cb: ProgressCallback | None,
+    cancel_cb: Callable[[], None] | None,
 ) -> tuple[dict[tuple[int, int], tuple[float, float]], list[float] | None, dict[str, object]]:
     from functools import lru_cache
 
@@ -263,9 +263,13 @@ def refine_positions_and_gains(
 
     measured = 0
     gain_measured = 0
+    if progress_cb is not None:
+        progress_cb("stitch-refine", "Refining tile positions", 0, len(candidates), "pairs")
     for idx_edge, (i, j, dx_pred, dy_pred) in enumerate(candidates):
-        p1 = str(entries[int(i)].path)
-        p2 = str(entries[int(j)].path)
+        if cancel_cb is not None:
+            cancel_cb()
+        p1 = str(entries[int(i)].alignment_path)
+        p2 = str(entries[int(j)].alignment_path)
         meas = _edge_measure(p1, p2, dx_pred_final=float(dx_pred), dy_pred_final=float(dy_pred))
         if meas is not None:
             pos_meas, gain_meas = meas
@@ -281,11 +285,13 @@ def refine_positions_and_gains(
                 _add_gain_edge(int(i), int(j), float(dg), float(wgt_g))
         else:
             _add_edge(int(i), int(j), float(dx_pred), float(dy_pred), 0.02)
-        if (idx_edge % 200) == 0 and (idx_edge + 1) < int(len(candidates)) and progress_cb is not None:
-            frac = float(idx_edge + 1) / float(max(1, int(len(candidates))))
+        if progress_cb is not None:
             progress_cb(
-                float(progress_base) + (float(progress_span) * float(frac)),
-                f"Stitching: refining positions ({idx_edge + 1}/{len(candidates)})…",
+                "stitch-refine",
+                "Refining tile positions",
+                idx_edge + 1,
+                len(candidates),
+                "pairs",
             )
 
     n_nodes = int(len(entries))
@@ -460,4 +466,3 @@ def refine_positions_and_gains(
 
     gc.collect()
     return refined_by_rc, refined_gains, refine_meta
-

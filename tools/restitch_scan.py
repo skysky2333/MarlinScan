@@ -5,11 +5,34 @@ import json
 import os
 import re
 import sys
+import tempfile
+from pathlib import Path
 
 
 _TILE_RE = re.compile(
     r"^tile_r(?P<row>\d+)_c(?P<col>\d+)_x(?P<x>-?\d+(?:\.\d+)?)_y(?P<y>-?\d+(?:\.\d+)?)\.(?:tif|png)$"
 )
+
+
+def _manifest_image_roles(tiles: list[dict[str, object]]) -> str:
+    if not tiles:
+        raise ValueError("Tile manifest is empty")
+    if not all(isinstance(tile, dict) for tile in tiles):
+        raise ValueError("Every tile manifest entry must be an object")
+    raw_complete = [
+        bool(str(tile.get("raw_file", "")).strip())
+        and bool(str(tile.get("scene_linear_file", "")).strip())
+        and bool(str(tile.get("display_file", "")).strip())
+        and "composite_file" not in tile
+        for tile in tiles
+    ]
+    raw_fields = {"raw_file", "scene_linear_file", "display_file", "composite_file"}
+    raw_marked = [bool(raw_fields.intersection(tile)) for tile in tiles]
+    if all(raw_complete):
+        return "raw"
+    if not any(raw_marked):
+        return "single"
+    raise ValueError("Tile manifest mixes or omits RAW image roles")
 
 
 def _infer_tiles_from_dir(scan_dir: str) -> list[dict[str, object]]:
@@ -241,8 +264,11 @@ def main(argv: list[str] | None = None) -> int:
                 tiles = json.load(f)
         except Exception as exc:
             print(f"Error: failed to read tiles.json: {exc}", file=sys.stderr)
-            tiles = None
-    if not isinstance(tiles, list) or not tiles:
+            return 2
+        if not isinstance(tiles, list) or not tiles:
+            print("Error: tiles.json must contain a non-empty array", file=sys.stderr)
+            return 2
+    else:
         tiles = _infer_tiles_from_dir(scan_dir)
         if not tiles:
             print(f"Error: no tiles found (tiles.json missing and no tile_*.tif files parsed): {scan_dir}", file=sys.stderr)
@@ -250,14 +276,25 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with open(tiles_path, "w", encoding="utf-8") as f:
                 json.dump(tiles, f, indent=2, sort_keys=False)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"Error: failed to write inferred tiles.json: {exc}", file=sys.stderr)
+            return 2
+    try:
+        image_roles = _manifest_image_roles(tiles)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
     try:
         from v3se_printer.scan.stitch_outputs import stitch_scan_outputs
+        from v3se_printer.scan.stitching.openexr import build_openexr_helper
+        from v3se_printer.progress import StepProgressTracker, format_step_progress
 
-        def _progress(pct: float, msg: str) -> None:
-            print(f"{pct:5.1f}% {msg}", file=sys.stderr)
+        progress_tracker = StepProgressTracker()
+
+        def _progress(phase: str, label: str, completed: int, total: int | None, unit: str) -> None:
+            current = progress_tracker.update(phase, label, completed, total, unit)
+            print(format_step_progress(current), file=sys.stderr)
 
         stitch_settings: dict[str, object] = {}
         if args.max_panorama_pixels is not None:
@@ -340,14 +377,27 @@ def main(argv: list[str] | None = None) -> int:
         if args.tiff_predictor is not None:
             stitch_settings["tiff_predictor"] = str(args.tiff_predictor)
 
-        stitch_scan_outputs(
-            tiles=list(tiles) if isinstance(tiles, list) else [],
-            out_dir=str(scan_dir),
-            build_pyramidal_tiff=True,
-            tiff_compression=str(args.compression),
-            progress_cb=_progress,
-            stitch_settings=stitch_settings or None,
-        )
+        stitch_args = {
+            "tiles": list(tiles) if isinstance(tiles, list) else [],
+            "out_dir": str(scan_dir),
+            "build_pyramidal_tiff": True,
+            "tiff_compression": str(args.compression),
+            "image_roles": image_roles,
+            "progress_cb": _progress,
+            "stitch_settings": stitch_settings or None,
+        }
+        if image_roles == "raw":
+            source = Path(repo_root) / "tools" / "write_openexr.cpp"
+            with tempfile.TemporaryDirectory(prefix="marlinscan-openexr-") as build_dir:
+                _progress("prepare-openexr", "Preparing OpenEXR writer", 0, 1, "writers")
+                helper = build_openexr_helper(
+                    source_path=source,
+                    output_path=Path(build_dir) / "write_openexr",
+                )
+                _progress("prepare-openexr", "Preparing OpenEXR writer", 1, 1, "writers")
+                stitch_scan_outputs(**stitch_args, openexr_helper=helper)
+        else:
+            stitch_scan_outputs(**stitch_args)
     except Exception as exc:
         print(f"Stitch failed: {exc}", file=sys.stderr)
         err_path = os.path.join(scan_dir, "stitch_error.txt")
@@ -361,4 +411,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

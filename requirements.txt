@@ -1,0 +1,9 @@
+fastapi==0.140.13
+gphoto2==2.6.4
+httpx2==2.9.1
+numpy==2.4.2
+opencv-python==4.13.0.92
+pyserial==3.5
+pyvips==3.1.1
+rawpy==0.27.0
+uvicorn[standard]==0.51.0
