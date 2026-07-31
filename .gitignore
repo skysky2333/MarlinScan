@@ -10,5 +10,6 @@ tools/__pycache__
 /v3se_printer/ui/__pycache__
 /scans
 /output/
+docs/media/IMG_*.MOV
 AGENTS.md
 PRD.md

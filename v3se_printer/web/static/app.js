@@ -1,3 +1,5 @@
+import { EditorPreviewRenderer } from "./editor-preview.js";
+
 "use strict";
 
 const byId = (id) => document.getElementById(id);
@@ -51,7 +53,18 @@ let editorLoading = false;
 let editorProject = null;
 let editorMaterial = "positive";
 let editorSource = "mosaic";
-let editorPreviewObjectUrl = null;
+let editorToneCurve = [0, 0.25, 0.5, 0.75, 1];
+let editorHslHue = Array(8).fill(0);
+let editorHslSaturation = Array(8).fill(0);
+let editorHslLightness = Array(8).fill(0);
+let editorHslBand = 0;
+let editorCurvePoint = 2;
+let editorPicker = null;
+let editorPickerStart = null;
+let editorPickerRect = null;
+let editorTileMapImage = null;
+let editorLoadedTileIndex = null;
+let editorRenderer = null;
 const pendingButtons = new Set();
 const rois = {
   exposure: { ...DEFAULT_ROI },
@@ -69,6 +82,18 @@ const exposureSampleCanvas = document.createElement("canvas");
 const exposureSampleContext = exposureSampleCanvas.getContext("2d", { willReadFrequently: true });
 const bedCanvas = byId("bed-canvas");
 const bedContext = bedCanvas.getContext("2d");
+const editorPreviewCanvas = byId("editor-preview-canvas");
+const editorPickerOverlay = byId("editor-picker-overlay");
+const editorPickerContext = editorPickerOverlay.getContext("2d");
+const editorTileMap = byId("editor-tile-map");
+const editorTileMapContext = editorTileMap.getContext("2d");
+const editorToneCurveCanvas = byId("editor-tone-curve");
+const editorToneCurveContext = editorToneCurveCanvas.getContext("2d");
+
+function requireEditorRenderer() {
+  if (editorRenderer === null) editorRenderer = new EditorPreviewRenderer(editorPreviewCanvas);
+  return editorRenderer;
+}
 
 function errorText(payload) {
   if (typeof payload.detail === "string") return payload.detail;
@@ -85,16 +110,6 @@ async function requestJson(path, method = "GET", body = null) {
   const payload = await response.json();
   if (!response.ok) throw new Error(errorText(payload));
   return payload;
-}
-
-async function requestBlob(path, body) {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) throw new Error(errorText(await response.json()));
-  return response.blob();
 }
 
 function showError(error) {
@@ -275,6 +290,7 @@ function renderStatus(status) {
   byId("system-state").textContent = state;
   byId("system-message").textContent = status.message;
   renderOperationProgress(status.step_progress);
+  renderEditorApplyProgress(status);
   stateDot.className = "state-dot";
   stateDot.classList.add(state === "faulted" ? "error" : active ? "busy" : "ready");
 
@@ -336,8 +352,9 @@ function renderStatus(status) {
     loadEditorProjects(preferred, false)
       .then(() => {
         if (revision === null || preview === null) throw new Error("Completed editor revision is missing its preview");
-        setEditorSource("mosaic", false);
-        showEditorPreview(preview.download_url, `Applied ${revision.revision}`);
+        return setEditorSource("mosaic").then(() => {
+          byId("editor-preview-state").textContent = `Applied ${revision.revision}`;
+        });
       })
       .catch(showError);
   }
@@ -351,6 +368,7 @@ function renderControls() {
   const state = snapshot === null ? "connecting" : snapshot.state;
   const mutationPending = Array.from(pendingButtons).some((button) => button.id !== "refresh-ports");
   const idle = state === "idle" && !mutationPending;
+  if ((!idle || editorLoading) && editorPicker !== null) cancelEditorPicker(false);
   const printerReady = printer !== null && printer.connected && printer.initialized && !printer.faulted;
   const cameraConnected = camera !== null && camera.connected;
   const cameraReady = cameraConnected && camera.shutter !== null && camera.configured_profile !== null;
@@ -384,8 +402,9 @@ function renderControls() {
   disabled("editor-refresh-projects", !idle || editorLoading);
   disabled("editor-tile", !idle || editorLoading || editorProject === null || editorSource !== "tile");
   disabled("editor-reset", !idle || editorProject === null);
-  disabled("editor-preview-button", !idle || editorLoading || editorProject === null);
   disabled("editor-apply", !idle || editorLoading || editorProject === null);
+  disabled("editor-pick-white-balance", !idle || editorLoading || editorProject === null);
+  disabled("editor-pick-film-base", !idle || editorLoading || editorProject === null);
   disabled("refresh-ports", false);
   document.querySelectorAll("#calibration-form input, #scan-form input").forEach((input) => {
     input.disabled = !idle;
@@ -396,12 +415,13 @@ function renderControls() {
   document.querySelectorAll(".jog-button").forEach((button) => {
     button.disabled = !printerReady || (!idle && state !== "jogging");
   });
-  document.querySelectorAll("[data-editor-source], [data-editor-material], .editor-control-tab").forEach((button) => {
+  document.querySelectorAll("[data-editor-source], [data-editor-material], .editor-control-tab, [data-hsl-band]").forEach((button) => {
     button.disabled = !idle || editorLoading || editorProject === null;
   });
-  document.querySelectorAll("#editor-form input").forEach((input) => {
-    input.disabled = !idle || editorProject === null;
+  document.querySelectorAll("#editor-form input, #editor-tone-curve").forEach((input) => {
+    input.disabled = !idle || editorLoading || editorProject === null;
   });
+  editorToneCurveCanvas.setAttribute("aria-disabled", String(!idle || editorLoading || editorProject === null));
 }
 
 function renderResults(status) {
@@ -556,10 +576,13 @@ function showApplicationWorkspace(name) {
 
 function renderEditorResult(result, results) {
   const container = byId("editor-result");
-  container.hidden = result == null;
+  const belongsToProject = result !== null
+    && editorProject !== null
+    && result.directory.startsWith(`${editorProject.directory}/revisions/`);
+  container.hidden = !belongsToProject;
   const list = byId("editor-result-files");
   list.replaceChildren();
-  if (result == null) return;
+  if (!belongsToProject) return;
   byId("editor-result-revision").textContent = String(result.revision);
   byId("editor-result-directory").textContent = result.directory;
   Object.entries(EDITOR_RESULT_LABELS).forEach(([artifact, label]) => {
@@ -576,42 +599,51 @@ function renderEditorResult(result, results) {
 }
 
 function clearEditorPreview() {
-  if (editorPreviewObjectUrl !== null) URL.revokeObjectURL(editorPreviewObjectUrl);
-  editorPreviewObjectUrl = null;
-  const image = byId("editor-preview-image");
-  image.removeAttribute("src");
-  image.hidden = true;
+  editorPreviewCanvas.hidden = true;
+  editorPickerOverlay.hidden = true;
   byId("editor-preview-empty").hidden = false;
 }
 
-function showEditorPreview(url, state, objectUrl = false) {
-  clearEditorPreview();
-  if (objectUrl) editorPreviewObjectUrl = url;
-  const image = byId("editor-preview-image");
-  const empty = byId("editor-preview-empty");
-  empty.querySelector("strong").textContent = "Loading preview";
-  empty.querySelector("span").textContent = "Reading scene-linear image data.";
-  image.onload = () => {
-    image.hidden = false;
-    empty.hidden = true;
-  };
-  image.onerror = () => {
-    image.hidden = true;
-    empty.hidden = false;
-    empty.querySelector("strong").textContent = "Preview unavailable";
-    empty.querySelector("span").textContent = "The selected source could not be displayed.";
-  };
-  image.src = objectUrl ? url : `${url}${url.includes("?") ? "&" : "?"}t=${Date.now()}`;
+function showEditorPreview(state) {
+  layoutEditorPreview();
+  editorPreviewCanvas.hidden = false;
+  byId("editor-preview-empty").hidden = true;
   byId("editor-preview-state").textContent = state;
+}
+
+function layoutEditorPreview() {
+  if (editorRenderer === null) return;
+  const dimensions = editorRenderer.dimensions;
+  if (dimensions === null) return;
+  const frame = editorPreviewCanvas.parentElement.getBoundingClientRect();
+  const scale = Math.min(frame.width / dimensions.width, frame.height / dimensions.height);
+  const width = Math.max(1, dimensions.width * scale);
+  const height = Math.max(1, dimensions.height * scale);
+  const left = (frame.width - width) / 2;
+  const top = (frame.height - height) / 2;
+  [editorPreviewCanvas, editorPickerOverlay].forEach((canvas) => {
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    canvas.style.left = `${left}px`;
+    canvas.style.top = `${top}px`;
+  });
+  const overlayScale = Math.min(1, 1600 / Math.max(dimensions.width, dimensions.height));
+  editorPickerOverlay.width = Math.max(1, Math.round(dimensions.width * overlayScale));
+  editorPickerOverlay.height = Math.max(1, Math.round(dimensions.height * overlayScale));
+  drawEditorPicker();
 }
 
 function clearEditorProject() {
   editorProject = null;
+  editorTileMapImage = null;
+  editorLoadedTileIndex = null;
   byId("editor-preview-title").textContent = "No project selected";
   setFieldText("editor-project-tiles", null);
   setFieldText("editor-project-revisions", null);
   setFieldText("editor-project-directory", null);
   byId("editor-tile").replaceChildren();
+  byId("editor-tile-navigator").hidden = true;
+  byId("editor-result").hidden = true;
   clearEditorPreview();
   byId("editor-preview-empty").querySelector("strong").textContent = "No scan loaded";
   byId("editor-preview-empty").querySelector("span").textContent = "Select a completed scan project.";
@@ -619,10 +651,17 @@ function clearEditorProject() {
   byId("editor-preview-state").textContent = "Original preview";
 }
 
-function renderEditorProject(project, resetRecipe = true) {
+async function renderEditorProject(project, resetRecipe = true) {
   if (!Array.isArray(project.tiles) || !Array.isArray(project.revisions)) {
     throw new TypeError("Editor project response must include tile and revision arrays");
   }
+  if (!Array.isArray(project.canvas_size) || project.canvas_size.length !== 2) {
+    throw new TypeError("Editor project response must include the mosaic canvas size");
+  }
+  project.tiles.forEach((tile) => {
+    if (!Array.isArray(tile.bounds) || tile.bounds.length !== 4) throw new TypeError("Editor tiles must include normalized bounds");
+  });
+  requireEditorRenderer();
   editorProject = project;
   byId("editor-preview-title").textContent = project.name;
   setFieldText("editor-project-tiles", String(project.tile_count));
@@ -636,7 +675,11 @@ function renderEditorProject(project, resetRecipe = true) {
     option.textContent = tile.label;
     tileSelect.append(option);
   });
-  if (resetRecipe) resetEditorRecipe();
+  if (resetRecipe) resetEditorRecipe(false);
+  await Promise.all([loadEditorTileMap(project.preview_url), loadEditorFullPreview()]);
+  byId("editor-tile-navigator").hidden = false;
+  if (snapshot !== null) renderEditorResult(snapshot.editor_result, snapshot.editor_results);
+  drawEditorTileMap();
 }
 
 function loadEditorProject(directory) {
@@ -692,9 +735,109 @@ function loadEditorProjects(preferredDirectory = null, resetRecipe = true) {
     });
 }
 
+function loadEditorTileMap(url) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      editorTileMapImage = image;
+      resolve();
+    };
+    image.onerror = () => reject(new Error("Could not load the editor tile map"));
+    image.src = url;
+  });
+}
+
+async function loadEditorFullPreview() {
+  byId("editor-preview-state").textContent = "Loading full image proxy";
+  const renderer = requireEditorRenderer();
+  await renderer.loadSource("full", editorProject.preview_url);
+  if (editorSource === "mosaic") {
+    renderer.switchSource("full");
+    renderer.setRecipe(editorRecipe());
+    showEditorPreview("Full image proxy · live adjustments");
+  }
+}
+
+async function loadEditorTilePreview(activate = true) {
+  const project = editorProject;
+  if (project === null) throw new Error("Select an editor project before loading a RAW tile");
+  const index = numberValue("editor-tile");
+  const previousIndex = editorLoadedTileIndex;
+  const params = new URLSearchParams({ project_dir: project.directory, tile_index: String(index) });
+  editorLoading = true;
+  byId("editor-preview-state").textContent = "Loading RAW-derived tile proxy";
+  renderControls();
+  try {
+    const renderer = requireEditorRenderer();
+    await renderer.loadSource("local", `/api/editor/tile-preview?${params}`);
+    if (editorProject !== project || numberValue("editor-tile") !== index) return false;
+    editorLoadedTileIndex = index;
+    if (activate) {
+      renderer.switchSource("local");
+      renderer.setRecipe(editorRecipe());
+      showEditorPreview("RAW-derived tile proxy · live adjustments");
+    }
+    return true;
+  } catch (error) {
+    if (editorProject === project) {
+      if (previousIndex !== null) byId("editor-tile").value = String(previousIndex);
+      showEditorPreview(editorSource === "mosaic" ? "Full image proxy · live adjustments" : "RAW-derived tile proxy · live adjustments");
+    }
+    throw error;
+  } finally {
+    editorLoading = false;
+    renderControls();
+    drawEditorTileMap();
+  }
+}
+
+function drawEditorTileMap() {
+  const width = editorTileMap.width;
+  const height = editorProject === null
+    ? editorTileMap.height
+    : Math.max(1, Math.round(width * editorProject.canvas_size[1] / editorProject.canvas_size[0]));
+  if (editorTileMap.height !== height) editorTileMap.height = height;
+  editorTileMapContext.clearRect(0, 0, width, height);
+  if (editorProject === null || editorTileMapImage === null) return;
+  editorTileMapContext.drawImage(editorTileMapImage, 0, 0, width, height);
+  const selected = Number(byId("editor-tile").value);
+  editorProject.tiles.slice().sort((left, right) => Number(left.index === selected) - Number(right.index === selected)).forEach((tile) => {
+    const [x0, y0, x1, y1] = tile.bounds;
+    const active = tile.index === selected;
+    editorTileMapContext.fillStyle = active ? "rgba(48, 137, 102, .24)" : "rgba(255, 255, 255, .04)";
+    editorTileMapContext.strokeStyle = active ? "#35c78b" : "rgba(255, 255, 255, .72)";
+    editorTileMapContext.lineWidth = active ? 3 : 1;
+    editorTileMapContext.fillRect(x0 * width, y0 * height, (x1 - x0) * width, (y1 - y0) * height);
+    editorTileMapContext.strokeRect(x0 * width, y0 * height, (x1 - x0) * width, (y1 - y0) * height);
+  });
+  const tile = editorProject.tiles.find((candidate) => candidate.index === selected);
+  byId("editor-tile-map-label").textContent = tile === undefined ? "No tile selected" : tile.label;
+}
+
+function selectEditorTileAt(event) {
+  if (editorProject === null || editorLoading || snapshot === null || snapshot.state !== "idle") return;
+  const rect = editorTileMap.getBoundingClientRect();
+  const x = (event.clientX - rect.left) / rect.width;
+  const y = (event.clientY - rect.top) / rect.height;
+  const candidates = editorProject.tiles.filter((tile) => {
+    const [x0, y0, x1, y1] = tile.bounds;
+    return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+  });
+  const pool = candidates.length === 0 ? editorProject.tiles : candidates;
+  const tile = pool.reduce((best, candidate) => {
+    const [x0, y0, x1, y1] = candidate.bounds;
+    const [bx0, by0, bx1, by1] = best.bounds;
+    const distance = (x - (x0 + x1) / 2) ** 2 + (y - (y0 + y1) / 2) ** 2;
+    const bestDistance = (x - (bx0 + bx1) / 2) ** 2 + (y - (by0 + by1) / 2) ** 2;
+    return distance < bestDistance ? candidate : best;
+  });
+  byId("editor-tile").value = String(tile.index);
+  setEditorSource("tile").catch(showError);
+}
+
 function editorRecipe() {
   return {
-    version: 1,
+    version: 2,
     material: editorMaterial,
     exposure_ev: numberValue("editor-exposure-ev"),
     temperature: numberValue("editor-temperature"),
@@ -712,39 +855,45 @@ function editorRecipe() {
     film_base_green: numberValue("editor-film-base-green"),
     film_base_blue: numberValue("editor-film-base-blue"),
     film_density: numberValue("editor-film-density"),
+    film_dmin: numberValue("editor-film-dmin"),
+    film_dmax: numberValue("editor-film-dmax"),
+    film_red_ratio: numberValue("editor-film-red-ratio"),
+    film_blue_ratio: numberValue("editor-film-blue-ratio"),
+    slide_fade: numberValue("editor-slide-fade"),
+    slide_black_red: numberValue("editor-slide-black-red"),
+    slide_black_green: numberValue("editor-slide-black-green"),
+    slide_black_blue: numberValue("editor-slide-black-blue"),
+    slide_white_red: numberValue("editor-slide-white-red"),
+    slide_white_green: numberValue("editor-slide-white-green"),
+    slide_white_blue: numberValue("editor-slide-white-blue"),
+    tone_curve: [...editorToneCurve],
+    hsl_hue: [...editorHslHue],
+    hsl_saturation: [...editorHslSaturation],
+    hsl_lightness: [...editorHslLightness],
   };
 }
 
-function validEditorRecipe(recipe) {
-  if (recipe.white_point > recipe.black_point) return true;
-  showError(new Error("White point must be greater than black point"));
-  return false;
+function editorRecipeError(recipe) {
+  if (recipe.white_point <= recipe.black_point) return "White point must be greater than black point";
+  if (recipe.film_dmax <= recipe.film_dmin) return "Dmax must be greater than Dmin";
+  for (const channel of ["red", "green", "blue"]) {
+    if (recipe[`slide_white_${channel}`] <= recipe[`slide_black_${channel}`]) return `Slide ${channel} white must be greater than black`;
+  }
+  return null;
 }
 
-function editorPreviewPayload() {
-  return {
-    project_dir: editorProject.directory,
-    source: editorSource,
-    tile_index: editorSource === "tile" ? numberValue("editor-tile") : null,
-    recipe: editorRecipe(),
-  };
-}
-
-function previewEditor() {
-  const button = byId("editor-preview-button");
-  const payload = editorPreviewPayload();
-  if (!validEditorRecipe(payload.recipe)) return;
-  clearNotice();
-  pendingButtons.add(button);
-  byId("editor-preview-state").textContent = "Rendering preview";
-  renderControls();
-  requestBlob("/api/editor/preview", payload)
-    .then((blob) => showEditorPreview(URL.createObjectURL(blob), "Recipe preview", true))
-    .catch(showError)
-    .finally(() => {
-      pendingButtons.delete(button);
-      renderControls();
-    });
+function renderEditorRecipe() {
+  if (editorProject === null || editorRenderer === null || editorRenderer.source === null) return;
+  const recipe = editorRecipe();
+  const error = editorRecipeError(recipe);
+  if (error !== null) {
+    byId("editor-preview-state").textContent = error;
+    return;
+  }
+  editorRenderer.setRecipe(recipe);
+  byId("editor-preview-state").textContent = editorSource === "mosaic"
+    ? "Full image proxy · live adjustments"
+    : "RAW-derived tile proxy · live adjustments";
 }
 
 function setEditorMaterial(material) {
@@ -754,11 +903,23 @@ function setEditorMaterial(material) {
     button.classList.toggle("active", active);
     button.setAttribute("aria-selected", active ? "true" : "false");
   });
-  byId("editor-film-controls").hidden = material !== "negative";
-  byId("editor-preview-state").textContent = "Changes not previewed";
+  byId("editor-positive-film-controls").hidden = material !== "positive";
+  byId("editor-negative-film-controls").hidden = material === "positive";
+  byId("editor-color-negative-controls").hidden = material !== "color_negative";
+  renderEditorRecipe();
 }
 
-function setEditorSource(source, renderPreview = true) {
+async function setEditorSource(source, renderPreview = true) {
+  if (renderPreview && editorProject !== null) {
+    const renderer = requireEditorRenderer();
+    if (source === "mosaic") {
+      renderer.switchSource("full");
+      renderer.setRecipe(editorRecipe());
+    } else if (!await loadEditorTilePreview(false)) {
+      return;
+    }
+  }
+  cancelEditorPicker(false);
   editorSource = source;
   document.querySelectorAll("[data-editor-source]").forEach((button) => {
     const active = button.dataset.editorSource === source;
@@ -768,7 +929,16 @@ function setEditorSource(source, renderPreview = true) {
   byId("editor-tile-field").hidden = source !== "tile";
   byId("editor-preview-source-label").textContent = source === "mosaic" ? "Full image" : "Local RAW";
   renderControls();
-  if (renderPreview && editorProject !== null) previewEditor();
+  if (!renderPreview || editorProject === null) return;
+  if (source === "mosaic") {
+    showEditorPreview("Full image proxy · live adjustments");
+  } else {
+    const renderer = requireEditorRenderer();
+    renderer.switchSource("local");
+    renderer.setRecipe(editorRecipe());
+    showEditorPreview("RAW-derived tile proxy · live adjustments");
+  }
+  drawEditorTileMap();
 }
 
 function showEditorControlPanel(panelId) {
@@ -786,7 +956,7 @@ function syncEditorControl(input) {
   output.textContent = input.dataset.editorField === "exposure_ev" ? `${value.toFixed(1)} EV` : value.toFixed(2);
 }
 
-function resetEditorRecipe() {
+function resetEditorRecipe(renderPreview = true) {
   const defaults = {
     exposure_ev: 0,
     temperature: 0,
@@ -804,15 +974,236 @@ function resetEditorRecipe() {
     film_base_green: 1,
     film_base_blue: 1,
     film_density: 1,
+    film_dmin: 0,
+    film_dmax: 4,
+    film_red_ratio: 1,
+    film_blue_ratio: 1,
+    slide_fade: 0,
+    slide_black_red: 0,
+    slide_black_green: 0,
+    slide_black_blue: 0,
+    slide_white_red: 1,
+    slide_white_green: 1,
+    slide_white_blue: 1,
   };
   document.querySelectorAll("[data-editor-field]").forEach((input) => {
     input.value = String(defaults[input.dataset.editorField]);
     syncEditorControl(input);
   });
+  editorToneCurve = [0, 0.25, 0.5, 0.75, 1];
+  editorHslHue = Array(8).fill(0);
+  editorHslSaturation = Array(8).fill(0);
+  editorHslLightness = Array(8).fill(0);
+  editorHslBand = 0;
+  editorCurvePoint = 2;
+  syncEditorHslControls();
+  drawEditorToneCurve();
+  editorToneCurveCanvas.setAttribute("aria-valuenow", "0.5");
+  editorToneCurveCanvas.setAttribute("aria-label", "Master tone curve, point 3 at 0.50");
   setEditorMaterial("positive");
   showEditorControlPanel("editor-basic-controls");
   setEditorSource("mosaic", false);
-  if (editorProject !== null) showEditorPreview(editorProject.preview_url, "Original preview");
+  if (renderPreview && editorProject !== null) {
+    const renderer = requireEditorRenderer();
+    renderer.switchSource("full");
+    renderer.setRecipe(editorRecipe());
+    showEditorPreview("Full image proxy · live adjustments");
+  }
+  renderEditorRecipe();
+}
+
+function drawEditorToneCurve() {
+  const width = editorToneCurveCanvas.width;
+  const height = editorToneCurveCanvas.height;
+  editorToneCurveContext.clearRect(0, 0, width, height);
+  editorToneCurveContext.strokeStyle = "#344145";
+  editorToneCurveContext.lineWidth = 1;
+  for (let index = 1; index < 4; index += 1) {
+    const x = width * index / 4;
+    const y = height * index / 4;
+    editorToneCurveContext.beginPath();
+    editorToneCurveContext.moveTo(x, 0);
+    editorToneCurveContext.lineTo(x, height);
+    editorToneCurveContext.moveTo(0, y);
+    editorToneCurveContext.lineTo(width, y);
+    editorToneCurveContext.stroke();
+  }
+  editorToneCurveContext.strokeStyle = "#58d4a1";
+  editorToneCurveContext.lineWidth = 4;
+  editorToneCurveContext.beginPath();
+  editorToneCurve.forEach((value, index) => {
+    const x = width * index / 4;
+    const y = height * (1 - value);
+    if (index === 0) editorToneCurveContext.moveTo(x, y);
+    else editorToneCurveContext.lineTo(x, y);
+  });
+  editorToneCurveContext.stroke();
+  editorToneCurve.forEach((value, index) => {
+    editorToneCurveContext.beginPath();
+    editorToneCurveContext.arc(width * index / 4, height * (1 - value), index === editorCurvePoint ? 9 : 6, 0, Math.PI * 2);
+    editorToneCurveContext.fillStyle = index === editorCurvePoint ? "#fff" : "#58d4a1";
+    editorToneCurveContext.fill();
+  });
+}
+
+function setEditorCurvePoint(index, value) {
+  editorCurvePoint = Math.max(0, Math.min(4, index));
+  editorToneCurve[editorCurvePoint] = Math.max(0, Math.min(1, value));
+  editorToneCurveCanvas.setAttribute("aria-label", `Master tone curve, point ${editorCurvePoint + 1} at ${editorToneCurve[editorCurvePoint].toFixed(2)}`);
+  editorToneCurveCanvas.setAttribute("aria-valuenow", editorToneCurve[editorCurvePoint].toFixed(2));
+  drawEditorToneCurve();
+  renderEditorRecipe();
+}
+
+function editorCurvePointer(event) {
+  const rect = editorToneCurveCanvas.getBoundingClientRect();
+  const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+  setEditorCurvePoint(Math.round(x * 4), 1 - y);
+}
+
+function syncEditorHslControls() {
+  document.querySelectorAll("[data-hsl-band]").forEach((button) => {
+    const active = Number(button.dataset.hslBand) === editorHslBand;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-checked", active ? "true" : "false");
+    button.tabIndex = active ? 0 : -1;
+  });
+  const values = { hue: editorHslHue, saturation: editorHslSaturation, lightness: editorHslLightness };
+  Object.entries(values).forEach(([axis, entries]) => {
+    const input = byId(`editor-hsl-${axis}`);
+    input.value = String(entries[editorHslBand]);
+    input.parentElement.querySelector("output").textContent = axis === "hue" ? `${entries[editorHslBand].toFixed(0)}°` : entries[editorHslBand].toFixed(2);
+  });
+}
+
+function updateEditorHsl(input) {
+  const values = { hue: editorHslHue, saturation: editorHslSaturation, lightness: editorHslLightness }[input.dataset.hslAxis];
+  values[editorHslBand] = input.valueAsNumber;
+  syncEditorHslControls();
+  renderEditorRecipe();
+}
+
+function startEditorPicker(kind) {
+  editorPicker = kind;
+  editorPickerStart = null;
+  editorPickerRect = {
+    x: editorPickerOverlay.width * 0.4,
+    y: editorPickerOverlay.height * 0.4,
+    width: editorPickerOverlay.width * 0.2,
+    height: editorPickerOverlay.height * 0.2,
+  };
+  editorPickerOverlay.hidden = false;
+  editorPickerOverlay.tabIndex = 0;
+  editorPickerOverlay.setAttribute("aria-hidden", "false");
+  editorPickerOverlay.focus();
+  drawEditorPicker();
+  byId("editor-preview-state").textContent = kind === "white_balance" ? "Draw a neutral region" : "Draw an unexposed film-base region";
+}
+
+function cancelEditorPicker(restoreFocus = true) {
+  const picker = editorPicker;
+  editorPicker = null;
+  editorPickerStart = null;
+  editorPickerRect = null;
+  editorPickerOverlay.hidden = true;
+  editorPickerOverlay.tabIndex = -1;
+  editorPickerOverlay.setAttribute("aria-hidden", "true");
+  if (restoreFocus && picker !== null) {
+    byId(picker === "white_balance" ? "editor-pick-white-balance" : "editor-pick-film-base").focus();
+  }
+}
+
+function drawEditorPicker() {
+  editorPickerContext.clearRect(0, 0, editorPickerOverlay.width, editorPickerOverlay.height);
+  if (editorPickerRect === null) return;
+  editorPickerContext.fillStyle = "rgba(53, 199, 139, .18)";
+  editorPickerContext.strokeStyle = "#58d4a1";
+  editorPickerContext.lineWidth = 3;
+  editorPickerContext.fillRect(editorPickerRect.x, editorPickerRect.y, editorPickerRect.width, editorPickerRect.height);
+  editorPickerContext.strokeRect(editorPickerRect.x, editorPickerRect.y, editorPickerRect.width, editorPickerRect.height);
+}
+
+function editorPickerPoint(event) {
+  const rect = editorPickerOverlay.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(editorPickerOverlay.width, (event.clientX - rect.left) / rect.width * editorPickerOverlay.width)),
+    y: Math.max(0, Math.min(editorPickerOverlay.height, (event.clientY - rect.top) / rect.height * editorPickerOverlay.height)),
+  };
+}
+
+function updateEditorPickerRect(point) {
+  const x = Math.min(editorPickerStart.x, point.x);
+  const y = Math.min(editorPickerStart.y, point.y);
+  editorPickerRect = { x, y, width: Math.max(1, Math.abs(point.x - editorPickerStart.x)), height: Math.max(1, Math.abs(point.y - editorPickerStart.y)) };
+  drawEditorPicker();
+}
+
+function editorSourceSampleRect() {
+  const dimensions = requireEditorRenderer().dimensions;
+  const scaleX = dimensions.width / editorPickerOverlay.width;
+  const scaleY = dimensions.height / editorPickerOverlay.height;
+  const selectedWidth = Math.max(1, Math.ceil(editorPickerRect.width * scaleX));
+  const selectedHeight = Math.max(1, Math.ceil(editorPickerRect.height * scaleY));
+  const width = Math.min(256, selectedWidth);
+  const height = Math.min(256, selectedHeight);
+  const x = Math.floor(editorPickerRect.x * scaleX + (selectedWidth - width) / 2);
+  const y = Math.floor(editorPickerRect.y * scaleY + (selectedHeight - height) / 2);
+  return { x: Math.min(x, dimensions.width - width), y: Math.min(y, dimensions.height - height), width, height };
+}
+
+function editorSampleMean(sample) {
+  const mean = [0, 0, 0];
+  for (let index = 0; index < sample.pixels.length; index += 4) {
+    mean[0] += sample.pixels[index];
+    mean[1] += sample.pixels[index + 1];
+    mean[2] += sample.pixels[index + 2];
+  }
+  const count = sample.width * sample.height;
+  return mean.map((value) => value / count);
+}
+
+function setEditorInput(id, value) {
+  const input = byId(id);
+  input.value = String(Math.max(Number(input.min), Math.min(Number(input.max), value)));
+  syncEditorControl(input);
+}
+
+function applyEditorPicker() {
+  const [red, green, blue] = editorSampleMean(requireEditorRenderer().samplePixels(editorSourceSampleRect(), "source"));
+  if (editorPicker === "white_balance") {
+    if (Math.min(red, green, blue) <= 0) throw new Error("The neutral region must contain positive RGB values");
+    const geometric = Math.cbrt(red * green * blue);
+    setEditorInput("editor-temperature", 0.5 * Math.log2(blue / red));
+    setEditorInput("editor-tint", Math.log2(green / geometric));
+  } else {
+    setEditorInput("editor-film-base-red", red);
+    setEditorInput("editor-film-base-green", green);
+    setEditorInput("editor-film-base-blue", blue);
+  }
+  cancelEditorPicker();
+  renderEditorRecipe();
+}
+
+function renderEditorApplyProgress(status) {
+  const container = byId("editor-apply-progress");
+  if (status.state !== "editing") {
+    container.hidden = true;
+    return;
+  }
+  container.hidden = false;
+  const progress = status.step_progress;
+  const bar = byId("editor-apply-progress-bar");
+  if (progress === null) {
+    byId("editor-apply-progress-label").textContent = "Preparing revision";
+    byId("editor-apply-progress-count").textContent = "ETA unavailable";
+    bar.removeAttribute("value");
+    return;
+  }
+  byId("editor-apply-progress-label").textContent = progress.label;
+  byId("editor-apply-progress-count").textContent = `${progress.total === null ? progress.completed : `${progress.completed}/${progress.total}`} ${progress.unit} · ETA ${formatEta(progress.eta_seconds)}`;
+  if (progress.total === null) bar.removeAttribute("value");
+  else bar.value = progress.total === 0 ? 1 : progress.completed / progress.total;
 }
 
 function scheduleStatusPoll() {
@@ -1866,7 +2257,7 @@ byId("editor-project").addEventListener("change", () => {
   loadEditorProject(textValue("editor-project")).catch(showError);
 });
 document.querySelectorAll("[data-editor-source]").forEach((button) => {
-  button.addEventListener("click", () => setEditorSource(button.dataset.editorSource));
+  button.addEventListener("click", () => setEditorSource(button.dataset.editorSource).catch(showError));
 });
 document.querySelectorAll("[data-editor-material]").forEach((button) => {
   button.addEventListener("click", () => setEditorMaterial(button.dataset.editorMaterial));
@@ -1877,16 +2268,148 @@ document.querySelectorAll(".editor-control-tab").forEach((tab) => {
 document.querySelectorAll("[data-editor-field]").forEach((input) => {
   input.addEventListener("input", () => {
     syncEditorControl(input);
-    byId("editor-preview-state").textContent = "Changes not previewed";
+    renderEditorRecipe();
   });
 });
-byId("editor-tile").addEventListener("change", previewEditor);
-byId("editor-reset").addEventListener("click", resetEditorRecipe);
-byId("editor-preview-button").addEventListener("click", previewEditor);
+document.querySelectorAll("[data-hsl-axis]").forEach((input) => input.addEventListener("input", () => updateEditorHsl(input)));
+document.querySelectorAll("[data-hsl-band]").forEach((button) => {
+  button.addEventListener("click", () => {
+    editorHslBand = Number(button.dataset.hslBand);
+    syncEditorHslControls();
+  });
+  button.addEventListener("keydown", (event) => {
+    const delta = { ArrowLeft: -1, ArrowUp: -1, ArrowRight: 1, ArrowDown: 1 }[event.key];
+    if (delta === undefined) return;
+    event.preventDefault();
+    editorHslBand = (editorHslBand + delta + 8) % 8;
+    syncEditorHslControls();
+    document.querySelector(`[data-hsl-band="${editorHslBand}"]`).focus();
+  });
+});
+byId("editor-tile").addEventListener("change", () => loadEditorTilePreview().catch(showError));
+byId("editor-reset").addEventListener("click", () => resetEditorRecipe());
+byId("editor-pick-white-balance").addEventListener("click", () => startEditorPicker("white_balance"));
+byId("editor-pick-film-base").addEventListener("click", () => startEditorPicker("film_base"));
+editorTileMap.addEventListener("pointerup", selectEditorTileAt);
+editorTileMap.addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key) || editorProject === null || editorLoading || snapshot === null || snapshot.state !== "idle") return;
+  event.preventDefault();
+  const current = editorProject.tiles.find((tile) => tile.index === numberValue("editor-tile"));
+  if (current === undefined) return;
+  const [rowDelta, colDelta] = {
+    ArrowLeft: [0, -1],
+    ArrowRight: [0, 1],
+    ArrowUp: [-1, 0],
+    ArrowDown: [1, 0],
+  }[event.key];
+  const next = editorProject.tiles.find((tile) => tile.row === current.row + rowDelta && tile.col === current.col + colDelta);
+  if (next === undefined) return;
+  byId("editor-tile").value = String(next.index);
+  setEditorSource("tile").catch(showError);
+});
+editorToneCurveCanvas.addEventListener("pointerdown", (event) => {
+  if (editorProject === null || editorLoading || snapshot === null || snapshot.state !== "idle") return;
+  editorToneCurveCanvas.setPointerCapture(event.pointerId);
+  editorCurvePointer(event);
+});
+editorToneCurveCanvas.addEventListener("pointermove", (event) => {
+  if (!editorToneCurveCanvas.hasPointerCapture(event.pointerId)) return;
+  if (editorLoading || snapshot === null || snapshot.state !== "idle") {
+    editorToneCurveCanvas.releasePointerCapture(event.pointerId);
+    return;
+  }
+  editorCurvePointer(event);
+});
+editorToneCurveCanvas.addEventListener("pointerup", (event) => {
+  if (editorToneCurveCanvas.hasPointerCapture(event.pointerId)) editorToneCurveCanvas.releasePointerCapture(event.pointerId);
+});
+editorToneCurveCanvas.addEventListener("pointercancel", (event) => {
+  if (editorToneCurveCanvas.hasPointerCapture(event.pointerId)) editorToneCurveCanvas.releasePointerCapture(event.pointerId);
+});
+editorToneCurveCanvas.addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key) || editorProject === null || editorLoading || snapshot === null || snapshot.state !== "idle") return;
+  event.preventDefault();
+  if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+    editorCurvePoint = Math.max(0, Math.min(4, editorCurvePoint + (event.key === "ArrowLeft" ? -1 : 1)));
+    editorToneCurveCanvas.setAttribute("aria-label", `Master tone curve, point ${editorCurvePoint + 1} at ${editorToneCurve[editorCurvePoint].toFixed(2)}`);
+    editorToneCurveCanvas.setAttribute("aria-valuenow", editorToneCurve[editorCurvePoint].toFixed(2));
+    drawEditorToneCurve();
+  } else {
+    setEditorCurvePoint(editorCurvePoint, editorToneCurve[editorCurvePoint] + (event.key === "ArrowUp" ? 0.01 : -0.01));
+  }
+});
+editorPickerOverlay.addEventListener("pointerdown", (event) => {
+  if (editorPicker === null || editorLoading || snapshot === null || snapshot.state !== "idle") return;
+  editorPickerOverlay.setPointerCapture(event.pointerId);
+  editorPickerStart = editorPickerPoint(event);
+  updateEditorPickerRect(editorPickerStart);
+});
+editorPickerOverlay.addEventListener("pointermove", (event) => {
+  if (editorPickerStart !== null && editorPickerOverlay.hasPointerCapture(event.pointerId)) updateEditorPickerRect(editorPickerPoint(event));
+});
+editorPickerOverlay.addEventListener("pointerup", (event) => {
+  if (!editorPickerOverlay.hasPointerCapture(event.pointerId)) return;
+  if (editorPicker === null || editorLoading || snapshot === null || snapshot.state !== "idle") {
+    editorPickerOverlay.releasePointerCapture(event.pointerId);
+    editorPickerStart = null;
+    return;
+  }
+  updateEditorPickerRect(editorPickerPoint(event));
+  editorPickerOverlay.releasePointerCapture(event.pointerId);
+  editorPickerStart = null;
+  try {
+    applyEditorPicker();
+  } catch (error) {
+    showError(error);
+  }
+});
+editorPickerOverlay.addEventListener("pointercancel", (event) => {
+  if (editorPickerOverlay.hasPointerCapture(event.pointerId)) editorPickerOverlay.releasePointerCapture(event.pointerId);
+  editorPickerStart = null;
+});
+editorPickerOverlay.addEventListener("keydown", (event) => {
+  if (editorPicker === null || editorPickerRect === null || editorLoading || snapshot === null || snapshot.state !== "idle") return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    cancelEditorPicker();
+    renderEditorRecipe();
+    return;
+  }
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    try {
+      applyEditorPicker();
+    } catch (error) {
+      showError(error);
+    }
+    return;
+  }
+  if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+  event.preventDefault();
+  const horizontal = Math.max(1, Math.round(editorPickerOverlay.width / 100));
+  const vertical = Math.max(1, Math.round(editorPickerOverlay.height / 100));
+  if (event.shiftKey) {
+    if (event.key === "ArrowLeft") editorPickerRect.width = Math.max(1, editorPickerRect.width - horizontal);
+    if (event.key === "ArrowRight") editorPickerRect.width = Math.min(editorPickerOverlay.width - editorPickerRect.x, editorPickerRect.width + horizontal);
+    if (event.key === "ArrowUp") editorPickerRect.height = Math.max(1, editorPickerRect.height - vertical);
+    if (event.key === "ArrowDown") editorPickerRect.height = Math.min(editorPickerOverlay.height - editorPickerRect.y, editorPickerRect.height + vertical);
+  } else {
+    if (event.key === "ArrowLeft") editorPickerRect.x = Math.max(0, editorPickerRect.x - horizontal);
+    if (event.key === "ArrowRight") editorPickerRect.x = Math.min(editorPickerOverlay.width - editorPickerRect.width, editorPickerRect.x + horizontal);
+    if (event.key === "ArrowUp") editorPickerRect.y = Math.max(0, editorPickerRect.y - vertical);
+    if (event.key === "ArrowDown") editorPickerRect.y = Math.min(editorPickerOverlay.height - editorPickerRect.height, editorPickerRect.y + vertical);
+  }
+  drawEditorPicker();
+});
 byId("editor-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const recipe = editorRecipe();
-  if (!validEditorRecipe(recipe)) return;
+  const error = editorRecipeError(recipe);
+  if (error !== null) {
+    showError(new Error(error));
+    return;
+  }
+  cancelEditorPicker(false);
   action(byId("editor-apply"), "/api/editor/apply", {
     project_dir: editorProject.directory,
     recipe,
@@ -1963,6 +2486,12 @@ window.addEventListener("keyup", (event) => {
 });
 window.addEventListener("blur", stopJog);
 window.addEventListener("pagehide", stopJog);
+window.addEventListener("pagehide", (event) => {
+  if (!event.persisted && editorRenderer !== null) {
+    editorRenderer.destroy();
+    editorRenderer = null;
+  }
+});
 
 document.querySelectorAll(".workflow-tab").forEach((tab) => tab.addEventListener("click", () => showWorkflowPanel(tab.dataset.panel)));
 byId("auto-exposure").addEventListener("click", () => {
@@ -2006,12 +2535,13 @@ byId("scan-form").addEventListener("submit", (event) => {
 new ResizeObserver(drawCapture).observe(captureCanvas);
 new ResizeObserver(drawCenterLoupe).observe(loupeCanvas);
 new ResizeObserver(drawBed).observe(bedCanvas);
+new ResizeObserver(layoutEditorPreview).observe(editorPreviewCanvas.parentElement);
 updateRoiReadout();
 drawCapture();
 drawCenterLoupe();
 drawExposureAnalysis();
 drawBed();
 renderEstimatedDpi();
-resetEditorRecipe();
+resetEditorRecipe(false);
 loadPorts();
 pollStatus();

@@ -460,7 +460,7 @@ class ScannerServiceTests(unittest.TestCase):
         self.assertEqual(status["message"], "Stopped")
         self.assertIsNone(status["editor_result"])
 
-    def test_editor_preview_reserves_the_shared_operation_lock(self) -> None:
+    def test_editor_tile_preview_reserves_the_shared_operation_lock(self) -> None:
         project = object()
         started = threading.Event()
         release = threading.Event()
@@ -476,7 +476,7 @@ class ScannerServiceTests(unittest.TestCase):
             side_effect=render,
         ):
             thread = threading.Thread(
-                target=lambda: result.append(self.service.editor_preview("/scan", EditRecipe(), "mosaic", None))
+                target=lambda: result.append(self.service.editor_tile_preview("/scan", 2))
             )
             thread.start()
             self.assertTrue(started.wait(1.0))
@@ -1931,7 +1931,7 @@ class ScannerServiceTests(unittest.TestCase):
             self.assertEqual(z_move["speed_mm_s"], 10.0)
             self.assertEqual(set(z_move), {"z", "speed_mm_s"})
             self.assertAlmostEqual(z_move["z"], tile["z_mm"])
-        self.assertEqual(self.sleeps, [0.25] * 9)
+        self.assertEqual(self.sleeps, [1.0] * 9)
 
     def test_scan_preflights_openexr_before_camera_or_motion(self) -> None:
         mesh = FocusMesh(0.0, 50.0, 0.0, 34.0, 10.0, 10.0, 10.0, 10.0)

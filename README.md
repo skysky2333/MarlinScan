@@ -4,6 +4,14 @@ MarlinScan is a local scanning workstation that uses a Marlin-controlled printer
 
 The primary application is a Python service with a browser interface. Printer and camera access remain in the local Python process; the browser handles positioning, calibration, scan setup, progress, stopping, and result review.
 
+[![MarlinScan hardware scanning a test target](docs/images/scanner-rig.jpg)](docs/media/scanner-in-motion.m4v)
+
+One measured 140-position scan produced a `38,324 x 36,167` image: **1.386 gigapixels at 4,998 DPI**. By output pixel count, that is about 23 times a [61 MP Sony A7R V frame](https://www.sony.com/electronics/support/e-mount-body-ilce-7-series/ilce-7rm5/specifications), 9.2 times a [151 MP Phase One IQ4 frame](https://www.phaseone.com/wp-content/uploads/2021/12/IQ_Camera_System_Overview_Flyer.pdf), and 5.8 times the A7R V's 240.8 MP Pixel Shift output. This is a spatial-output comparison, not a claim of single-shot equivalence: the MarlinScan result required a static flat subject, 140 Nikon captures, stitching, about 53 minutes, and a 67 GB working project. Dynamic range, noise, color accuracy, optical resolution, and motion tolerance still depend on each tile and the physical setup.
+
+![MarlinScan Capture workspace](docs/images/capture-workspace.png)
+
+Start with the [documentation index](docs/index.md), [five-minute workflow](docs/quick-start.md), or [complete configuration reference](docs/configuration.md). The focused guides cover [hardware](docs/hardware.md), [macOS installation](docs/install-macos.md), [Capture](docs/capture-workspace.md), [Editor](docs/editor.md), [outputs and large-image tools](docs/outputs.md), [recovery](docs/troubleshooting.md), [architecture](docs/architecture.md), and the [measured benchmark](docs/benchmarks.md).
+
 ## Hardware Scope
 
 - A Marlin-compatible printer or motion stage connected over USB serial
@@ -107,6 +115,8 @@ Grid autofocus samples the four points formed by the 25 and 75 percent positions
 
 Scan bounds describe the finished image's physical coverage, not the camera-center travel. Defaults are `X15-205 mm` and `Y25-205 mm`; each scan minimum or maximum has a **Use current** button for the corresponding live stage coordinate. The outer tile centers are inset from those bounds by half the `25 x 17 mm` camera footprint, so the outer image edges meet the requested coverage. Tile spacing follows the selected overlap.
 
+Each tile waits `1000 ms` after the final XYZ move before capture by default so stage vibration can decay. The Settle control applies to both normal and Quick acquisition and remains adjustable from `0` to `5000 ms`.
+
 The Position map previews the separated tile grid from the current scan settings before capture. While scanning it shows the serpentine planned route, completed route, current location, completed count, active phase, and estimated phase time remaining. Status refreshes more frequently while work is active, and successful calibration or scanning opens Results automatically without an acknowledgement step.
 
 Normal acquisition downloads each JPEG first so it can appear promptly, then its matching NEF, while RAW development overlaps the following tile. Optional **Quick acquisition** stores every JPEG+NEF pair on the camera card during stage motion, records the remote-to-tile mapping, and imports all pairs before development and stitching. Quick acquisition shortens the moving phase but tile images do not appear until import; normal acquisition remains the default.
@@ -136,11 +146,13 @@ The NEFs, manifests, calibration state, development recipe, and transforms are t
 
 ## Image Editor
 
-The **Editor** workspace loads completed RAW scan projects independently of the capture controls. It previews either the complete mosaic or one local RAW-derived tile, and provides global basic, advanced, positive-film, and negative-film controls. Negative-only controls stay hidden in positive mode. The editor intentionally has no brushes, masks, selections, dodge, or burn tools.
+The **Editor** workspace loads completed RAW scan projects independently of the capture controls. The full-image view loads the saved 2000-pixel mosaic once; the Local RAW view uses the clickable tile map to load one RAW-derived tile. Both remain in GPU memory, so sliders, the five-point curve, and the eight-band HSL mixer update continuously without a Preview button. Switching back to Full Image does not rebuild the mosaic.
+
+Basic includes a drawn-region global white-balance picker. Film separates Positive/Slide, Color Negative, and B&W Negative development, including unexposed-base sampling, density inversion and range controls, and channel-response controls where applicable. These sampling rectangles set global recipe values; they are not retained local masks. The editor intentionally has no brushes, adjustment masks, selections, dodge, or burn tools.
 
 Custom scan output locations are remembered by the service, so their completed projects remain available in Editor after a restart.
 
-**Preview** renders the current recipe without changing project files. **Apply to all RAW** develops every original NEF with the shared recipe, reuses the scan's saved alignment transforms, and writes a new immutable numbered revision beneath the scan folder. Each revision contains a linear Rec.2020 working EXR, flat and pyramidal 16-bit TIFFs, a JPEG preview, and the exact edit and revision metadata. Original NEFs and earlier revisions are never overwritten.
+Interactive previews are fast display proxies. **Apply to all RAW** performs the authoritative full-precision operation: it develops every original NEF with the shared recipe, reuses the scan's saved alignment transforms, and writes a new immutable numbered revision beneath the scan folder. Its dedicated progress panel reports every NEF, compositing, EXR, TIFF, pyramid, preview, metadata, and cleanup phase with count and ETA. Each revision contains a linear Rec.2020 working EXR, flat and pyramidal 16-bit TIFFs, a JPEG preview, and the exact edit and revision metadata. Original NEFs and earlier revisions are never overwritten.
 
 Gigapixel scans are normally edited through the full-image proxy or a local RAW tile, then rendered tile by tile and composed with the saved geometry. This is also how large aerial and whole-slide systems avoid loading a complete image into interactive memory. The full-resolution NEF-backed project and float EXR are the archival/editable path; DNG is not the canonical output because common RAW editors cannot reliably open BigDNG mosaics of this size.
 

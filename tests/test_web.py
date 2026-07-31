@@ -180,8 +180,8 @@ class FakeService:
             raise FileNotFoundError(project_dir)
         return self.editor_preview_path
 
-    def editor_preview(self, project_dir: str, recipe: object, source: str, tile_index: int | None) -> bytes:
-        self.calls.append(("editor_preview", project_dir, recipe, source, tile_index))
+    def editor_tile_preview(self, project_dir: str, tile_index: int) -> bytes:
+        self.calls.append(("editor_tile_preview", project_dir, tile_index))
         return b"editor-jpeg"
 
     def start_editor_apply(self, project_dir: str, recipe: object) -> dict[str, object]:
@@ -477,7 +477,9 @@ class WebTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.service.calls[0][0], "start_scan")
-        self.assertTrue(self.service.calls[0][1].quick_acquisition)
+        plan = self.service.calls[0][1]
+        self.assertTrue(plan.quick_acquisition)
+        self.assertEqual(plan.settle_ms, 1000)
 
     def test_editor_routes_use_strict_global_recipe_and_allowlisted_files(self) -> None:
         with TemporaryDirectory() as directory:
@@ -497,25 +499,22 @@ class WebTests(unittest.TestCase):
             self.service.editor_project_detail = {
                 **self.service.editor_project_records[0],
                 "revisions": [],
-                "tiles": [{"index": 0, "row": 0, "col": 0, "label": "R1 C1"}],
+                "canvas_size": [12, 6],
+                "tile_size": [8, 6],
+                "tiles": [{"index": 0, "row": 0, "col": 0, "label": "R1 C1", "bounds": [0, 0, 2 / 3, 1]}],
                 "preview_url": "/api/editor/original-preview?project_dir=scan-1",
             }
 
             projects = self.client.get("/api/editor/projects")
             project = self.client.post("/api/editor/project", json={"project_dir": directory})
             original = self.client.get("/api/editor/original-preview", params={"project_dir": directory})
-            tile_preview = self.client.post(
-                "/api/editor/preview",
-                json={
-                    "project_dir": directory,
-                    "source": "tile",
-                    "tile_index": 0,
-                    "recipe": {"material": "negative", "film_density": 1.5},
-                },
+            tile_preview = self.client.get(
+                "/api/editor/tile-preview",
+                params={"project_dir": directory, "tile_index": 0},
             )
             apply = self.client.post(
                 "/api/editor/apply",
-                json={"project_dir": directory, "recipe": {"exposure_ev": 0.5}},
+                json={"project_dir": directory, "recipe": {"material": "color_negative", "film_density": 1.5}},
             )
 
             self.assertEqual(projects.json(), {"projects": self.service.editor_project_records})
@@ -524,18 +523,14 @@ class WebTests(unittest.TestCase):
             self.assertEqual(tile_preview.content, b"editor-jpeg")
             self.assertEqual(tile_preview.headers["content-type"], "image/jpeg")
             self.assertEqual(apply.status_code, 200)
-            preview_call = next(call for call in self.service.calls if call[0] == "editor_preview")
-            self.assertEqual((preview_call[1], preview_call[3], preview_call[4]), (directory, "tile", 0))
-            self.assertEqual(preview_call[2].material, "negative")
-            self.assertEqual(preview_call[2].film_density, 1.5)
+            preview_call = next(call for call in self.service.calls if call[0] == "editor_tile_preview")
+            self.assertEqual(preview_call[1:], (directory, 0))
             apply_call = next(call for call in self.service.calls if call[0] == "start_editor_apply")
-            self.assertEqual(apply_call[2].exposure_ev, 0.5)
+            self.assertEqual(apply_call[2].material, "color_negative")
+            self.assertEqual(apply_call[2].film_density, 1.5)
 
             self.assertEqual(
-                self.client.post(
-                    "/api/editor/preview",
-                    json={"project_dir": directory, "source": "tile", "recipe": {}},
-                ).status_code,
+                self.client.get("/api/editor/tile-preview", params={"project_dir": directory}).status_code,
                 422,
             )
             self.assertEqual(
@@ -781,6 +776,7 @@ class WebTests(unittest.TestCase):
     def test_editor_workspace_uses_global_recipe_contract(self) -> None:
         index = (DEFAULT_STATIC_DIR / "index.html").read_text(encoding="utf-8")
         script = (DEFAULT_STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        renderer = (DEFAULT_STATIC_DIR / "editor-preview.js").read_text(encoding="utf-8")
         styles = (DEFAULT_STATIC_DIR / "styles.css").read_text(encoding="utf-8")
         editor = index[index.index('id="editor-workspace"') :]
         self.assertIn('data-workspace="capture"', index)
@@ -788,8 +784,15 @@ class WebTests(unittest.TestCase):
         self.assertIn('data-editor-source="mosaic"', editor)
         self.assertIn('data-editor-source="tile"', editor)
         self.assertIn('data-editor-material="positive"', editor)
-        self.assertIn('data-editor-material="negative"', editor)
-        self.assertIn('id="editor-film-controls" hidden', editor)
+        self.assertIn('data-editor-material="color_negative"', editor)
+        self.assertIn('data-editor-material="bw_negative"', editor)
+        self.assertIn('id="editor-film-controls" role="tabpanel" aria-labelledby="editor-film-tab" hidden', editor)
+        self.assertIn('id="editor-tile-map"', editor)
+        self.assertIn('id="editor-preview-canvas"', editor)
+        self.assertIn('id="editor-pick-white-balance"', editor)
+        self.assertIn('id="editor-tone-curve"', editor)
+        self.assertIn('data-hsl-band="7"', editor)
+        self.assertIn('id="editor-apply-progress-bar"', editor)
         for field, minimum, maximum in (
             ("editor-black-point", "-1", "0.95"),
             ("editor-white-point", "0.01", "8"),
@@ -817,6 +820,17 @@ class WebTests(unittest.TestCase):
             "film_base_green",
             "film_base_blue",
             "film_density",
+            "film_dmin",
+            "film_dmax",
+            "film_red_ratio",
+            "film_blue_ratio",
+            "slide_fade",
+            "slide_black_red",
+            "slide_black_green",
+            "slide_black_blue",
+            "slide_white_red",
+            "slide_white_green",
+            "slide_white_blue",
         ):
             self.assertIn(f'data-editor-field="{field}"', editor)
             self.assertIn(f"{field}: numberValue(", script)
@@ -824,7 +838,16 @@ class WebTests(unittest.TestCase):
             self.assertNotIn(forbidden, editor.lower())
         self.assertIn('requestJson("/api/editor/projects")', script)
         self.assertIn('requestJson("/api/editor/project", "POST", { project_dir: directory })', script)
-        self.assertIn('requestBlob("/api/editor/preview", payload)', script)
+        self.assertIn("let editorRenderer = null;", script)
+        self.assertIn("function requireEditorRenderer()", script)
+        self.assertIn('renderer.loadSource("full", editorProject.preview_url)', script)
+        self.assertIn('renderer.loadSource("local", `/api/editor/tile-preview?${params}`)', script)
+        self.assertIn('editorRenderer.setRecipe(recipe);', script)
+        self.assertIn("if (!event.persisted && editorRenderer !== null)", script)
+        self.assertIn('result.directory.startsWith(`${editorProject.directory}/revisions/`)', script)
+        self.assertNotIn('/api/editor/preview', script)
+        self.assertIn("export class EditorPreviewRenderer", renderer)
+        self.assertIn("requestAnimationFrame", renderer)
         self.assertIn('action(byId("editor-apply"), "/api/editor/apply"', script)
         self.assertIn("Object.entries(EDITOR_RESULT_LABELS)", script)
         self.assertIn("download.href = file.download_url;", script)

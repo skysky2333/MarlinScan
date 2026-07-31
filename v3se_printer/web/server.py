@@ -149,7 +149,7 @@ class ScanStartRequest(RequestModel):
     output_dir: Text
     speed_xy_mm_s: XYSpeed = 200.0
     speed_z_mm_s: ZSpeed = 10.0
-    settle_ms: StrictInt = Field(default=250, ge=0, le=5000)
+    settle_ms: StrictInt = Field(default=1000, ge=0, le=5000)
     quick_acquisition: StrictBool = False
 
     def plan(self) -> ScanPlan:
@@ -199,8 +199,8 @@ class WhiteBalanceRequest(RequestModel):
 
 
 class EditRecipeRequest(RequestModel):
-    version: StrictInt = 1
-    material: Literal["positive", "negative"] = "positive"
+    version: StrictInt = 2
+    material: Literal["positive", "color_negative", "bw_negative"] = "positive"
     exposure_ev: FiniteFloat = 0.0
     temperature: FiniteFloat = 0.0
     tint: FiniteFloat = 0.0
@@ -217,6 +217,21 @@ class EditRecipeRequest(RequestModel):
     film_base_green: FiniteFloat = 1.0
     film_base_blue: FiniteFloat = 1.0
     film_density: FiniteFloat = 1.0
+    film_dmin: FiniteFloat = 0.0
+    film_dmax: FiniteFloat = 4.0
+    film_red_ratio: FiniteFloat = 1.0
+    film_blue_ratio: FiniteFloat = 1.0
+    slide_fade: FiniteFloat = 0.0
+    slide_black_red: FiniteFloat = 0.0
+    slide_black_green: FiniteFloat = 0.0
+    slide_black_blue: FiniteFloat = 0.0
+    slide_white_red: FiniteFloat = 1.0
+    slide_white_green: FiniteFloat = 1.0
+    slide_white_blue: FiniteFloat = 1.0
+    tone_curve: tuple[FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat] = (0.0, 0.25, 0.5, 0.75, 1.0)
+    hsl_hue: tuple[FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat] = (0.0,) * 8
+    hsl_saturation: tuple[FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat] = (0.0,) * 8
+    hsl_lightness: tuple[FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat, FiniteFloat] = (0.0,) * 8
 
     def value(self) -> EditRecipe:
         return EditRecipe(**self.model_dump())
@@ -224,20 +239,6 @@ class EditRecipeRequest(RequestModel):
 
 class EditorProjectRequest(RequestModel):
     project_dir: Text
-
-
-class EditorPreviewRequest(EditorProjectRequest):
-    source: Literal["mosaic", "tile"]
-    tile_index: StrictInt | None = None
-    recipe: EditRecipeRequest
-
-    @model_validator(mode="after")
-    def validate_source(self) -> "EditorPreviewRequest":
-        if self.source == "mosaic" and self.tile_index is not None:
-            raise ValueError("Mosaic preview does not accept a tile index")
-        if self.source == "tile" and self.tile_index is None:
-            raise ValueError("Tile preview requires a tile index")
-        return self
 
 
 class EditorApplyRequest(EditorProjectRequest):
@@ -404,14 +405,9 @@ def create_app(
         preview = scanner.editor_original_preview(project_dir)
         return FileResponse(preview, media_type="image/jpeg")
 
-    @app.post("/api/editor/preview", response_class=Response)
-    def editor_preview(request: EditorPreviewRequest) -> Response:
-        image = scanner.editor_preview(
-            request.project_dir,
-            request.recipe.value(),
-            request.source,
-            request.tile_index,
-        )
+    @app.get("/api/editor/tile-preview", response_class=Response)
+    def editor_tile_preview(project_dir: str, tile_index: int) -> Response:
+        image = scanner.editor_tile_preview(project_dir, tile_index)
         return Response(content=image, media_type="image/jpeg")
 
     @app.post("/api/editor/apply")

@@ -276,7 +276,7 @@ class ScanPlan:
     output_dir: str
     speed_xy_mm_s: float = DEFAULT_XY_SPEED_MM_S
     speed_z_mm_s: float = DEFAULT_Z_SPEED_MM_S
-    settle_ms: int = 250
+    settle_ms: int = 1000
     quick_acquisition: bool = False
 
     def __post_init__(self) -> None:
@@ -522,13 +522,7 @@ class ScannerService:
             raise FileNotFoundError(preview)
         return preview
 
-    def editor_preview(
-        self,
-        project_dir: str,
-        recipe: EditRecipe,
-        source: str,
-        tile_index: int | None,
-    ) -> bytes:
+    def editor_tile_preview(self, project_dir: str, tile_index: int) -> bytes:
         if not self._operation_lock.acquire(blocking=False):
             raise ServiceStateError("Another scanner operation is already running")
         try:
@@ -536,7 +530,7 @@ class ScannerService:
                 if self._state != "idle":
                     raise ServiceStateError(f"Cannot preview while {self._state}")
             project = self._load_editor_project(project_dir)
-            return render_editor_preview(project, recipe, source, tile_index)  # type: ignore[arg-type]
+            return render_editor_preview(project, EditRecipe(), "tile", tile_index)
         finally:
             self._operation_lock.release()
 

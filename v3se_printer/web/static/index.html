@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MarlinScan</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -275,7 +276,7 @@
               <label class="field"><span>Frame width</span><input id="scan-frame-width" type="number" min="0.01" max="500" step="0.01" value="25" required></label>
               <label class="field"><span>Frame height</span><input id="scan-frame-height" type="number" min="0.01" max="500" step="0.01" value="17" required></label>
               <label class="field"><span>Overlap (%)</span><input id="scan-overlap" type="number" min="0.1" max="89.9" step="0.1" value="25" required></label>
-              <label class="field"><span>Settle (ms)</span><input id="scan-settle" type="number" min="0" max="5000" step="1" value="250" required></label>
+              <label class="field"><span>Settle (ms)</span><input id="scan-settle" type="number" min="0" max="5000" step="1" value="1000" required></label>
               <label class="check-field span-two"><input id="scan-quick-acquisition" type="checkbox"><span>Quick acquisition: capture to the camera card, then import all tiles</span></label>
             </div>
             <div class="capture-density">
@@ -341,6 +342,10 @@
         <button class="icon-button" id="editor-refresh-projects" type="button" aria-label="Refresh scan projects" title="Refresh scan projects">&#8635;</button>
       </div>
       <label class="field wide"><span>Scan project</span><select id="editor-project" disabled><option value="">No completed scans</option></select></label>
+      <section class="editor-tile-navigator" id="editor-tile-navigator" aria-labelledby="editor-tile-navigator-title" hidden>
+        <div class="editor-subheading"><strong id="editor-tile-navigator-title">RAW tile map</strong><span id="editor-tile-map-label">No tile selected</span></div>
+        <canvas id="editor-tile-map" width="480" height="320" tabindex="0" aria-label="RAW tile map. Use arrow keys to select adjacent tiles">Use arrow keys to select adjacent RAW tiles.</canvas>
+      </section>
       <dl class="editor-project-details">
         <div><dt>Source tiles</dt><dd id="editor-project-tiles">-</dd></div>
         <div><dt>Revisions</dt><dd id="editor-project-revisions">-</dd></div>
@@ -365,7 +370,8 @@
         </div>
       </div>
       <div class="editor-image-frame">
-        <img id="editor-preview-image" alt="Edited scan preview" hidden>
+        <canvas id="editor-preview-canvas" width="1600" height="1000" aria-label="Edited scan preview" hidden></canvas>
+        <canvas id="editor-picker-overlay" width="1600" height="1000" tabindex="-1" role="group" aria-label="Region picker. Arrow keys move; Shift plus arrow keys resize; Enter applies; Escape cancels" aria-hidden="true" hidden></canvas>
         <div class="editor-preview-empty" id="editor-preview-empty"><strong>No scan loaded</strong><span>Select a completed scan project.</span></div>
       </div>
       <div class="editor-preview-status" role="status" aria-live="polite">
@@ -377,12 +383,14 @@
     <aside class="editor-controls-pane" aria-labelledby="editor-controls-title">
       <div class="editor-heading"><div><p class="eyebrow">Develop</p><h1 id="editor-controls-title">Global adjustments</h1></div></div>
       <div class="editor-material segmented" role="tablist" aria-label="Film material">
-        <button class="segment active" type="button" role="tab" aria-selected="true" data-editor-material="positive">Positive</button>
-        <button class="segment" type="button" role="tab" aria-selected="false" data-editor-material="negative">Negative</button>
+        <button class="segment active" type="button" role="tab" aria-selected="true" data-editor-material="positive">Positive / slide</button>
+        <button class="segment" type="button" role="tab" aria-selected="false" data-editor-material="color_negative">Color negative</button>
+        <button class="segment" type="button" role="tab" aria-selected="false" data-editor-material="bw_negative">B&amp;W negative</button>
       </div>
       <div class="editor-control-tabs" role="tablist" aria-label="Editor controls">
         <button class="editor-control-tab active" id="editor-basic-tab" type="button" role="tab" aria-controls="editor-basic-controls" aria-selected="true" data-editor-controls="editor-basic-controls">Basic</button>
         <button class="editor-control-tab" id="editor-advanced-tab" type="button" role="tab" aria-controls="editor-advanced-controls" aria-selected="false" data-editor-controls="editor-advanced-controls">Advanced</button>
+        <button class="editor-control-tab" id="editor-film-tab" type="button" role="tab" aria-controls="editor-film-controls" aria-selected="false" data-editor-controls="editor-film-controls">Film</button>
       </div>
       <form id="editor-form">
         <section class="editor-control-panel" id="editor-basic-controls" role="tabpanel" aria-labelledby="editor-basic-tab">
@@ -395,6 +403,7 @@
           <label class="editor-control"><span>Black point</span><input id="editor-black-point" data-editor-field="black_point" type="range" min="-1" max="0.95" step="0.01" value="0"><output for="editor-black-point">0.00</output></label>
           <label class="editor-control"><span>White point</span><input id="editor-white-point" data-editor-field="white_point" type="range" min="0.01" max="8" step="0.01" value="1"><output for="editor-white-point">1.00</output></label>
           <label class="editor-control"><span>Saturation</span><input id="editor-saturation" data-editor-field="saturation" type="range" min="0" max="3" step="0.01" value="1"><output for="editor-saturation">1.00</output></label>
+          <button class="button secondary wide editor-picker-button" id="editor-pick-white-balance" type="button">Pick neutral region</button>
         </section>
         <section class="editor-control-panel" id="editor-advanced-controls" role="tabpanel" aria-labelledby="editor-advanced-tab" hidden>
           <fieldset class="editor-control-group">
@@ -403,23 +412,70 @@
             <label class="editor-control"><span>Green</span><input id="editor-green-balance" data-editor-field="green_balance" type="range" min="0.1" max="4" step="0.01" value="1"><output for="editor-green-balance">1.00</output></label>
             <label class="editor-control"><span>Blue</span><input id="editor-blue-balance" data-editor-field="blue_balance" type="range" min="0.1" max="4" step="0.01" value="1"><output for="editor-blue-balance">1.00</output></label>
           </fieldset>
-          <fieldset class="editor-control-group" id="editor-film-controls" hidden>
-            <legend>Negative film</legend>
+          <fieldset class="editor-control-group">
+            <legend>Master curve</legend>
+            <canvas class="editor-tone-curve" id="editor-tone-curve" width="600" height="300" tabindex="0" role="slider" aria-label="Master tone curve, point 3 at 0.50" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0.5">Use Left and Right to select a control point, then Up and Down to adjust it.</canvas>
+          </fieldset>
+          <fieldset class="editor-control-group">
+            <legend>HSL mixer</legend>
+            <div class="editor-hsl-bands" role="radiogroup" aria-label="HSL color channel">
+              <button type="button" class="active" role="radio" aria-checked="true" data-hsl-band="0" aria-label="Red" title="Red"></button>
+              <button type="button" role="radio" aria-checked="false" data-hsl-band="1" aria-label="Orange" title="Orange"></button>
+              <button type="button" role="radio" aria-checked="false" data-hsl-band="2" aria-label="Yellow" title="Yellow"></button>
+              <button type="button" role="radio" aria-checked="false" data-hsl-band="3" aria-label="Green" title="Green"></button>
+              <button type="button" role="radio" aria-checked="false" data-hsl-band="4" aria-label="Aqua" title="Aqua"></button>
+              <button type="button" role="radio" aria-checked="false" data-hsl-band="5" aria-label="Blue" title="Blue"></button>
+              <button type="button" role="radio" aria-checked="false" data-hsl-band="6" aria-label="Purple" title="Purple"></button>
+              <button type="button" role="radio" aria-checked="false" data-hsl-band="7" aria-label="Magenta" title="Magenta"></button>
+            </div>
+            <label class="editor-control"><span>Hue</span><input id="editor-hsl-hue" data-hsl-axis="hue" type="range" min="-30" max="30" step="1" value="0"><output for="editor-hsl-hue">0°</output></label>
+            <label class="editor-control"><span>Saturation</span><input id="editor-hsl-saturation" data-hsl-axis="saturation" type="range" min="-1" max="1" step="0.01" value="0"><output for="editor-hsl-saturation">0.00</output></label>
+            <label class="editor-control"><span>Lightness</span><input id="editor-hsl-lightness" data-hsl-axis="lightness" type="range" min="-1" max="1" step="0.01" value="0"><output for="editor-hsl-lightness">0.00</output></label>
+          </fieldset>
+        </section>
+        <section class="editor-control-panel" id="editor-film-controls" role="tabpanel" aria-labelledby="editor-film-tab" hidden>
+          <fieldset class="editor-control-group" id="editor-positive-film-controls">
+            <legend>Positive / slide recovery</legend>
+            <label class="editor-control"><span>Fade repair</span><input id="editor-slide-fade" data-editor-field="slide_fade" type="range" min="0" max="1" step="0.01" value="0"><output for="editor-slide-fade">0.00</output></label>
+            <div class="editor-film-points">
+              <strong>Channel black</strong>
+              <label class="editor-control"><span>Red</span><input id="editor-slide-black-red" data-editor-field="slide_black_red" type="range" min="-1" max="0.99" step="0.01" value="0"><output for="editor-slide-black-red">0.00</output></label>
+              <label class="editor-control"><span>Green</span><input id="editor-slide-black-green" data-editor-field="slide_black_green" type="range" min="-1" max="0.99" step="0.01" value="0"><output for="editor-slide-black-green">0.00</output></label>
+              <label class="editor-control"><span>Blue</span><input id="editor-slide-black-blue" data-editor-field="slide_black_blue" type="range" min="-1" max="0.99" step="0.01" value="0"><output for="editor-slide-black-blue">0.00</output></label>
+              <strong>Channel white</strong>
+              <label class="editor-control"><span>Red</span><input id="editor-slide-white-red" data-editor-field="slide_white_red" type="range" min="0.01" max="8" step="0.01" value="1"><output for="editor-slide-white-red">1.00</output></label>
+              <label class="editor-control"><span>Green</span><input id="editor-slide-white-green" data-editor-field="slide_white_green" type="range" min="0.01" max="8" step="0.01" value="1"><output for="editor-slide-white-green">1.00</output></label>
+              <label class="editor-control"><span>Blue</span><input id="editor-slide-white-blue" data-editor-field="slide_white_blue" type="range" min="0.01" max="8" step="0.01" value="1"><output for="editor-slide-white-blue">1.00</output></label>
+            </div>
+          </fieldset>
+          <fieldset class="editor-control-group" id="editor-negative-film-controls" hidden>
+            <legend>Negative development</legend>
+            <button class="button secondary wide editor-picker-button" id="editor-pick-film-base" type="button">Pick unexposed film base</button>
             <label class="editor-control"><span>Base red</span><input id="editor-film-base-red" data-editor-field="film_base_red" type="range" min="0.01" max="4" step="0.01" value="1"><output for="editor-film-base-red">1.00</output></label>
             <label class="editor-control"><span>Base green</span><input id="editor-film-base-green" data-editor-field="film_base_green" type="range" min="0.01" max="4" step="0.01" value="1"><output for="editor-film-base-green">1.00</output></label>
             <label class="editor-control"><span>Base blue</span><input id="editor-film-base-blue" data-editor-field="film_base_blue" type="range" min="0.01" max="4" step="0.01" value="1"><output for="editor-film-base-blue">1.00</output></label>
             <label class="editor-control"><span>Density</span><input id="editor-film-density" data-editor-field="film_density" type="range" min="0.1" max="4" step="0.01" value="1"><output for="editor-film-density">1.00</output></label>
+            <label class="editor-control"><span>Dmin</span><input id="editor-film-dmin" data-editor-field="film_dmin" type="range" min="-4" max="3.99" step="0.01" value="0"><output for="editor-film-dmin">0.00</output></label>
+            <label class="editor-control"><span>Dmax</span><input id="editor-film-dmax" data-editor-field="film_dmax" type="range" min="-3.99" max="8" step="0.01" value="4"><output for="editor-film-dmax">4.00</output></label>
+            <div id="editor-color-negative-controls">
+              <label class="editor-control"><span>Red ratio</span><input id="editor-film-red-ratio" data-editor-field="film_red_ratio" type="range" min="0.1" max="4" step="0.01" value="1"><output for="editor-film-red-ratio">1.00</output></label>
+              <label class="editor-control"><span>Blue ratio</span><input id="editor-film-blue-ratio" data-editor-field="film_blue_ratio" type="range" min="0.1" max="4" step="0.01" value="1"><output for="editor-film-blue-ratio">1.00</output></label>
+            </div>
           </fieldset>
         </section>
+        <div class="editor-apply-progress" id="editor-apply-progress" role="status" aria-live="polite" hidden>
+          <span id="editor-apply-progress-label">Preparing revision</span>
+          <progress id="editor-apply-progress-bar" max="1" value="0"></progress>
+          <span id="editor-apply-progress-count">0/0 · ETA unavailable</span>
+        </div>
         <div class="editor-actions">
           <button class="button quiet" id="editor-reset" type="button">Reset</button>
-          <button class="button secondary" id="editor-preview-button" type="button" disabled>Preview</button>
           <button class="button primary" id="editor-apply" type="submit" disabled>Apply to all RAW</button>
         </div>
       </form>
     </aside>
   </main>
 
-  <script src="/static/app.js" defer></script>
+  <script type="module" src="/static/app.js"></script>
 </body>
 </html>

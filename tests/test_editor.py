@@ -13,11 +13,13 @@ import numpy as np  # type: ignore
 import pyvips  # type: ignore
 
 from v3se_printer.calibration import NormalizedROI
+from v3se_printer.color import REC2020_TO_SRGB_MATRIX, SRGB_TO_REC2020_MATRIX
 from v3se_printer.editor import (
     EditRecipe,
     apply_edit_recipe,
     apply_editor_revision,
     edit_recipe_from_dict,
+    editor_project_details,
     load_editor_project,
     render_editor_preview,
 )
@@ -28,12 +30,13 @@ class EditorTests(unittest.TestCase):
     def test_recipe_is_strict_and_neutral_recipe_is_identity(self) -> None:
         recipe = EditRecipe()
         values = np.asarray(
-            [[[0.1, 0.2, 0.3], [0.5, 1.0, 2.0]]],
+            [[[-0.25, 0.2, 0.3], [0.5, 1.0, 2.0]]],
             dtype=np.float32,
         )
 
-        np.testing.assert_allclose(apply_edit_recipe(values, recipe), values, rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(apply_edit_recipe(values, recipe), values)
         self.assertEqual(edit_recipe_from_dict(asdict(recipe)), recipe)
+        self.assertEqual(edit_recipe_from_dict(json.loads(json.dumps(asdict(recipe)))), recipe)
         with self.assertRaisesRegex(ValueError, "fields"):
             edit_recipe_from_dict({**asdict(recipe), "unknown": 1})
         with self.assertRaisesRegex(ValueError, "black point"):
@@ -44,12 +47,18 @@ class EditorTests(unittest.TestCase):
             EditRecipe(black_point=-1.01)
         with self.assertRaisesRegex(ValueError, "film_base_red"):
             EditRecipe(film_base_red=4.01)
+        with self.assertRaisesRegex(ValueError, "version"):
+            EditRecipe(version=1)
+        with self.assertRaisesRegex(ValueError, "material"):
+            EditRecipe(**{"material": "negative"})
 
     def test_recipe_bounds_match_the_editor_controls(self) -> None:
         EditRecipe(black_point=-1.0)
         EditRecipe(black_point=0.95, white_point=8.0)
         EditRecipe(white_point=0.01)
         EditRecipe(film_base_red=0.01, film_base_green=4.0, film_base_blue=4.0)
+        EditRecipe(film_dmin=-4.0, film_dmax=8.0, film_red_ratio=0.1, film_blue_ratio=4.0)
+        EditRecipe(slide_fade=1.0)
 
         for field, value in {
             "black_point": -1.01,
@@ -57,32 +66,145 @@ class EditorTests(unittest.TestCase):
             "film_base_red": 4.01,
             "film_base_green": 4.01,
             "film_base_blue": 4.01,
+            "film_dmin": -4.01,
+            "film_dmax": 8.01,
+            "film_red_ratio": 0.09,
+            "film_blue_ratio": 4.01,
+            "slide_fade": 1.01,
         }.items():
             with self.subTest(field=field):
                 with self.assertRaisesRegex(ValueError, field):
                     EditRecipe(**{field: value})
 
-    def test_negative_recipe_uses_film_base_and_optical_density(self) -> None:
+        with self.assertRaisesRegex(ValueError, "film dmin"):
+            EditRecipe(film_dmin=2.0, film_dmax=2.0)
+        with self.assertRaisesRegex(ValueError, "slide black"):
+            EditRecipe(slide_black_red=1.0, slide_white_red=1.0)
+
+    def test_recipe_arrays_are_fixed_length_finite_and_bounded(self) -> None:
+        recipe = asdict(EditRecipe())
+        for name, value in {
+            "tone_curve": [0.0, 0.25, 0.5, 1.0],
+            "hsl_hue": [0.0] * 7,
+            "hsl_saturation": [0.0] * 9,
+            "hsl_lightness": "not-an-array",
+        }.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, name):
+                    edit_recipe_from_dict({**recipe, name: value})
+        for name, value in {
+            "tone_curve": (0.0, 0.25, 0.5, 0.75, 1.01),
+            "hsl_hue": (31.0,) + (0.0,) * 7,
+            "hsl_saturation": (-1.01,) + (0.0,) * 7,
+            "hsl_lightness": (float("nan"),) + (0.0,) * 7,
+        }.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, name):
+                    EditRecipe(**{name: value})
+        with self.assertRaisesRegex(ValueError, "tone_curve"):
+            EditRecipe(**{"tone_curve": [0.0, 0.25, 0.5, 0.75, 1.0]})
+
+    def test_color_negative_uses_base_density_range_and_channel_ratios(self) -> None:
         source = np.asarray([[[0.5, 0.25, 0.125]]], dtype=np.float32)
+        neutral = apply_edit_recipe(source, EditRecipe(material="color_negative"))
+        adjusted = apply_edit_recipe(
+            np.full((1, 1, 3), 0.5, dtype=np.float32),
+            EditRecipe(
+                material="color_negative",
+                film_density=2.0,
+                film_red_ratio=2.0,
+                film_blue_ratio=0.5,
+                film_dmin=1.0,
+                film_dmax=5.0,
+            ),
+        )
+
+        np.testing.assert_allclose(neutral[0, 0], [0.25, 0.5, 0.75], rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(adjusted[0, 0], [0.75, 0.25, 0.0], rtol=1e-6, atol=1e-6)
+
+    def test_bw_negative_collapses_density_with_rec2020_luminance(self) -> None:
+        source = np.asarray([[[0.5, 0.25, 0.125]]], dtype=np.float32)
+        edited = apply_edit_recipe(source, EditRecipe(material="bw_negative"))
+        expected = 0.25 * 0.2627 + 0.5 * 0.6780 + 0.75 * 0.0593
+
+        np.testing.assert_allclose(edited, expected, rtol=1e-6, atol=1e-6)
+
+    def test_positive_slide_normalization_blends_per_channel(self) -> None:
+        source = np.asarray([[[0.25, 0.5, 0.75]]], dtype=np.float32)
         recipe = EditRecipe(
-            material="negative",
-            film_base_red=1.0,
-            film_base_green=1.0,
-            film_base_blue=1.0,
-            white_point=4.0,
+            slide_fade=0.5,
+            slide_black_red=0.1,
+            slide_black_green=0.2,
+            slide_black_blue=0.3,
+            slide_white_red=0.6,
+            slide_white_green=0.8,
+            slide_white_blue=1.3,
         )
 
         edited = apply_edit_recipe(source, recipe)
 
-        np.testing.assert_allclose(edited[0, 0], [0.25, 0.5, 0.75], rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(edited[0, 0], [0.275, 0.5, 0.6], rtol=1e-6, atol=1e-6)
+
+    def test_material_conversion_precedes_global_channel_gains(self) -> None:
+        source = np.full((1, 1, 3), 0.5, dtype=np.float32)
+
+        edited = apply_edit_recipe(
+            source,
+            EditRecipe(material="color_negative", red_balance=2.0),
+        )
+
+        np.testing.assert_allclose(edited[0, 0], [0.5, 0.25, 0.25], rtol=1e-6, atol=1e-6)
 
     def test_exposure_brightens_positive_and_negative_outputs(self) -> None:
         source = np.full((1, 1, 3), 0.8, dtype=np.float32)
-        for material in ("positive", "negative"):
+        for material in ("positive", "color_negative", "bw_negative"):
             with self.subTest(material=material):
                 neutral = apply_edit_recipe(source, EditRecipe(material=material))
                 brighter = apply_edit_recipe(source, EditRecipe(material=material, exposure_ev=1.0))
                 self.assertTrue(np.all(brighter > neutral))
+
+    def test_tone_curve_is_luminance_delta_and_preserves_headroom(self) -> None:
+        source = np.asarray(
+            [[[-0.5, -0.5, -0.5], [0.25, 0.25, 0.25], [2.0, 2.0, 2.0]]],
+            dtype=np.float32,
+        )
+
+        identity = apply_edit_recipe(source, EditRecipe())
+        edited = apply_edit_recipe(source, EditRecipe(tone_curve=(0.1, 0.5, 0.6, 0.8, 0.8)))
+
+        np.testing.assert_array_equal(identity, source)
+        np.testing.assert_allclose(edited[0, 0], [-0.4, -0.4, -0.4], rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(edited[0, 1], [0.5, 0.5, 0.5], rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(edited[0, 2], [1.8, 1.8, 1.8], rtol=1e-6, atol=1e-6)
+
+    def test_each_hsl_axis_changes_the_selected_color(self) -> None:
+        srgb_to_rec2020 = np.asarray(SRGB_TO_REC2020_MATRIX, dtype=np.float32)
+        rec2020_to_srgb = np.asarray(REC2020_TO_SRGB_MATRIX, dtype=np.float32)
+        red = np.asarray([[[1.0, 0.0, 0.0]]], dtype=np.float32) @ srgb_to_rec2020.T
+
+        hue = apply_edit_recipe(red, EditRecipe(hsl_hue=(30.0,) + (0.0,) * 7))
+        desaturated = apply_edit_recipe(red, EditRecipe(hsl_saturation=(-1.0,) + (0.0,) * 7))
+        lighter = apply_edit_recipe(red, EditRecipe(hsl_lightness=(0.5,) + (0.0,) * 7))
+
+        hue_srgb = hue @ rec2020_to_srgb.T
+        desaturated_srgb = desaturated @ rec2020_to_srgb.T
+        lighter_srgb = lighter @ rec2020_to_srgb.T
+        self.assertGreater(float(hue_srgb[0, 0, 1]), 0.1)
+        self.assertLess(float(np.ptp(desaturated_srgb[0, 0])), 1e-4)
+        self.assertGreater(float(lighter_srgb.mean()), float((red @ rec2020_to_srgb.T).mean()))
+
+    def test_combined_hsl_controls_keep_extended_values_finite(self) -> None:
+        source = np.asarray([[[-0.5, 0.2, 2.0], [3.0, -1.0, 0.5]]], dtype=np.float32)
+        recipe = EditRecipe(
+            hsl_hue=(30.0, -30.0, 15.0, -15.0, 20.0, -20.0, 10.0, -10.0),
+            hsl_saturation=(1.0, -1.0, 0.5, -0.5, 0.25, -0.25, 0.75, -0.75),
+            hsl_lightness=(-1.0, 1.0, -0.5, 0.5, -0.25, 0.25, -0.75, 0.75),
+        )
+
+        edited = apply_edit_recipe(source, recipe)
+
+        self.assertEqual(edited.dtype, np.float32)
+        self.assertTrue(np.isfinite(edited).all())
 
     def test_project_validation_blocks_paths_outside_scan(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -95,6 +217,22 @@ class EditorTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "inside the scan project"):
                 load_editor_project(scan, (root,))
+
+    def test_project_details_include_normalized_clipped_tile_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project = load_editor_project(self._make_project(root), (root,))
+            project.positions[(0, 1)] = (6, 0)
+
+            details = editor_project_details(project)
+
+            self.assertEqual(details["size"], [12, 6])
+            self.assertEqual(details["canvas_size"], [12, 6])
+            self.assertEqual(details["tile_size"], [8, 6])
+            tiles = details["tiles"]
+            assert isinstance(tiles, list)
+            np.testing.assert_allclose(tiles[0]["bounds"], [0.0, 0.0, 2.0 / 3.0, 1.0])
+            np.testing.assert_allclose(tiles[1]["bounds"], [0.5, 0.0, 1.0, 1.0])
 
     def test_tile_and_mosaic_previews_are_real_jpegs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -145,7 +283,9 @@ class EditorTests(unittest.TestCase):
                     for path in scan.glob("*.nef")
                 },
             )
-            self.assertEqual(json.loads((first / "edit_recipe.json").read_text(encoding="utf-8"))["exposure_ev"], 0.5)
+            saved_recipe = json.loads((first / "edit_recipe.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved_recipe["version"], 2)
+            self.assertEqual(saved_recipe["exposure_ev"], 0.5)
             self.assertEqual(develop_mock.call_count, 4)
             self.assertTrue(all(Path(call.args[0]).suffix.lower() == ".nef" for call in develop_mock.call_args_list))
 

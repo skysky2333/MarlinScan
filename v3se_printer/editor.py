@@ -15,7 +15,7 @@ import cv2  # type: ignore
 import numpy as np  # type: ignore
 import pyvips  # type: ignore
 
-from .color import REC2020_TO_SRGB_MATRIX, require_srgb_icc_profile
+from .color import REC2020_TO_SRGB_MATRIX, SRGB_TO_REC2020_MATRIX, require_srgb_icc_profile
 from .progress import ProgressCallback
 from .raw import develop_nef_scene, load_raw_development_recipe
 from .scan.stitching.composite import composite_tiles, feather_weight
@@ -34,13 +34,16 @@ EDITOR_RESULT_FILES = {
 }
 REC2020_LUMINANCE = np.asarray([0.2627, 0.6780, 0.0593], dtype=np.float32)
 REC2020_TO_SRGB = np.asarray(REC2020_TO_SRGB_MATRIX, dtype=np.float32)
+SRGB_TO_REC2020 = np.asarray(SRGB_TO_REC2020_MATRIX, dtype=np.float32)
+IDENTITY_TONE_CURVE = (0.0, 0.25, 0.5, 0.75, 1.0)
+NEUTRAL_HSL = (0.0,) * 8
 REVISION_PATTERN = re.compile(r"revision-(\d{3,})$")
 
 
 @dataclass(frozen=True)
 class EditRecipe:
-    version: int = 1
-    material: Literal["positive", "negative"] = "positive"
+    version: int = 2
+    material: Literal["positive", "color_negative", "bw_negative"] = "positive"
     exposure_ev: float = 0.0
     temperature: float = 0.0
     tint: float = 0.0
@@ -57,12 +60,27 @@ class EditRecipe:
     film_base_green: float = 1.0
     film_base_blue: float = 1.0
     film_density: float = 1.0
+    film_dmin: float = 0.0
+    film_dmax: float = 4.0
+    film_red_ratio: float = 1.0
+    film_blue_ratio: float = 1.0
+    slide_fade: float = 0.0
+    slide_black_red: float = 0.0
+    slide_black_green: float = 0.0
+    slide_black_blue: float = 0.0
+    slide_white_red: float = 1.0
+    slide_white_green: float = 1.0
+    slide_white_blue: float = 1.0
+    tone_curve: tuple[float, float, float, float, float] = IDENTITY_TONE_CURVE
+    hsl_hue: tuple[float, float, float, float, float, float, float, float] = NEUTRAL_HSL
+    hsl_saturation: tuple[float, float, float, float, float, float, float, float] = NEUTRAL_HSL
+    hsl_lightness: tuple[float, float, float, float, float, float, float, float] = NEUTRAL_HSL
 
     def __post_init__(self) -> None:
-        if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version != 1:
-            raise ValueError("Edit recipe version must be 1")
-        if self.material not in {"positive", "negative"}:
-            raise ValueError("Edit material must be positive or negative")
+        if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version != 2:
+            raise ValueError("Edit recipe version must be 2")
+        if self.material not in {"positive", "color_negative", "bw_negative"}:
+            raise ValueError("Edit material must be positive, color_negative, or bw_negative")
         bounded = {
             "exposure_ev": (-8.0, 8.0),
             "temperature": (-1.0, 1.0),
@@ -80,6 +98,11 @@ class EditRecipe:
             "film_base_green": (0.01, 4.0),
             "film_base_blue": (0.01, 4.0),
             "film_density": (0.1, 4.0),
+            "film_dmin": (-4.0, 4.0),
+            "film_dmax": (-4.0, 8.0),
+            "film_red_ratio": (0.1, 4.0),
+            "film_blue_ratio": (0.1, 4.0),
+            "slide_fade": (0.0, 1.0),
         }
         for name, (minimum, maximum) in bounded.items():
             value = getattr(self, name)
@@ -92,6 +115,34 @@ class EditRecipe:
                 raise ValueError(f"Edit recipe {name} must be from {minimum:g} through {maximum:g}")
         if self.black_point >= self.white_point:
             raise ValueError("Edit recipe black point must be below white point")
+        if self.film_dmin >= self.film_dmax:
+            raise ValueError("Edit recipe film dmin must be below film dmax")
+        slide_black = (self.slide_black_red, self.slide_black_green, self.slide_black_blue)
+        slide_white = (self.slide_white_red, self.slide_white_green, self.slide_white_blue)
+        if not all(
+            not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+            for value in (*slide_black, *slide_white)
+        ):
+            raise ValueError("Edit recipe slide points must be finite numbers")
+        if any(black >= white for black, white in zip(slide_black, slide_white, strict=True)):
+            raise ValueError("Edit recipe slide black points must be below slide white points")
+        self._validate_tuple("tone_curve", self.tone_curve, 5, 0.0, 1.0)
+        self._validate_tuple("hsl_hue", self.hsl_hue, 8, -30.0, 30.0)
+        self._validate_tuple("hsl_saturation", self.hsl_saturation, 8, -1.0, 1.0)
+        self._validate_tuple("hsl_lightness", self.hsl_lightness, 8, -1.0, 1.0)
+
+    @staticmethod
+    def _validate_tuple(name: str, values: tuple[float, ...], size: int, minimum: float, maximum: float) -> None:
+        if not isinstance(values, tuple) or len(values) != size or not all(
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+            and minimum <= value <= maximum
+            for value in values
+        ):
+            raise ValueError(
+                f"Edit recipe {name} must contain {size} finite values from {minimum:g} through {maximum:g}"
+            )
 
 
 @dataclass(frozen=True)
@@ -120,8 +171,14 @@ def edit_recipe_from_dict(payload: dict[str, object]) -> EditRecipe:
         raise ValueError("Edit recipe must be an object")
     expected = {field.name for field in fields(EditRecipe)}
     if set(payload) != expected:
-        raise ValueError("Edit recipe fields do not match version 1")
-    return EditRecipe(**payload)  # type: ignore[arg-type]
+        raise ValueError("Edit recipe fields do not match version 2")
+    values = dict(payload)
+    for name, size in (("tone_curve", 5), ("hsl_hue", 8), ("hsl_saturation", 8), ("hsl_lightness", 8)):
+        value = values[name]
+        if not isinstance(value, (list, tuple)) or len(value) != size:
+            raise ValueError(f"Edit recipe {name} must contain {size} values")
+        values[name] = tuple(value)
+    return EditRecipe(**values)  # type: ignore[arg-type]
 
 
 def editor_results(revision_dir: str | Path | None) -> dict[str, dict[str, str] | None]:
@@ -170,6 +227,8 @@ def editor_project_summary(project: EditorProject) -> dict[str, object]:
         "name": project.root.name,
         "tile_count": len(project.tiles),
         "size": [project.canvas_size[0], project.canvas_size[1]],
+        "canvas_size": [project.canvas_size[0], project.canvas_size[1]],
+        "tile_size": [project.tile_size[0], project.tile_size[1]],
         "revision_count": len(revisions),
     }
 
@@ -182,18 +241,29 @@ def editor_project_details(project: EditorProject) -> dict[str, object]:
         for path in revisions_root.iterdir()
         if path.is_dir() and REVISION_PATTERN.fullmatch(path.name) and (path / "revision_meta.json").is_file()
     )
-    return {
-        **summary,
-        "revisions": revisions,
-        "tiles": [
+    tiles = []
+    canvas_width, canvas_height = project.canvas_size
+    tile_width, tile_height = project.tile_size
+    for index, tile in enumerate(project.tiles):
+        x, y = project.positions[(tile.row, tile.col)]
+        tiles.append(
             {
                 "index": index,
                 "row": tile.row,
                 "col": tile.col,
                 "label": f"R{tile.row + 1} C{tile.col + 1} · {tile.raw_path.name}",
+                "bounds": [
+                    x / canvas_width,
+                    y / canvas_height,
+                    min(x + tile_width, canvas_width) / canvas_width,
+                    min(y + tile_height, canvas_height) / canvas_height,
+                ],
             }
-            for index, tile in enumerate(project.tiles)
-        ],
+        )
+    return {
+        **summary,
+        "revisions": revisions,
+        "tiles": tiles,
         "preview_url": f"/api/editor/original-preview?project_dir={quote(str(project.root), safe='')}",
     }
 
@@ -273,42 +343,152 @@ def load_editor_project(project_dir: str | Path, allowed_roots: tuple[str | Path
 def apply_edit_recipe(rgb: np.ndarray, recipe: EditRecipe) -> np.ndarray:
     if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.float32 or not np.isfinite(rgb).all():
         raise ValueError("Editor input must be finite float32 RGB")
-    result = rgb.copy()
-    temperature = np.float32(2.0**recipe.temperature)
-    tint = np.float32(2.0**recipe.tint)
-    gains = np.asarray(
-        [
-            recipe.red_balance * temperature * math.sqrt(float(tint)),
-            recipe.green_balance / tint,
-            recipe.blue_balance / temperature * math.sqrt(float(tint)),
-        ],
-        dtype=np.float32,
-    )
-    result *= gains
-    if recipe.material == "negative":
-        base = np.asarray(
-            [recipe.film_base_red, recipe.film_base_green, recipe.film_base_blue],
+    result = _convert_material(rgb.copy(), recipe)
+    if (
+        recipe.temperature != 0.0
+        or recipe.tint != 0.0
+        or recipe.red_balance != 1.0
+        or recipe.green_balance != 1.0
+        or recipe.blue_balance != 1.0
+    ):
+        temperature = np.float32(2.0**recipe.temperature)
+        tint = np.float32(2.0**recipe.tint)
+        result *= np.asarray(
+            [
+                recipe.red_balance * temperature * math.sqrt(float(tint)),
+                recipe.green_balance / tint,
+                recipe.blue_balance / temperature * math.sqrt(float(tint)),
+            ],
             dtype=np.float32,
         )
-        np.maximum(result / base, np.float32(2.0**-16), out=result)
-        np.log2(result, out=result)
-        result *= np.float32(-recipe.film_density)
-    result *= np.float32(2.0**recipe.exposure_ev)
-    result -= np.float32(recipe.black_point)
-    result /= np.float32(recipe.white_point - recipe.black_point)
-    unit = np.clip(result, 0.0, 1.0)
-    if recipe.shadows != 0:
-        result += np.float32(recipe.shadows * 0.25) * np.square(1.0 - unit)
-    if recipe.highlights != 0:
-        result += np.float32(recipe.highlights * 0.25) * np.square(unit)
-    result -= np.float32(0.18)
-    result *= np.float32(2.0**recipe.contrast)
-    result += np.float32(0.18)
-    luminance = result @ REC2020_LUMINANCE
-    result = luminance[:, :, None] + (result - luminance[:, :, None]) * np.float32(recipe.saturation)
+    if recipe.exposure_ev != 0.0:
+        result *= np.float32(2.0**recipe.exposure_ev)
+    if recipe.black_point != 0.0 or recipe.white_point != 1.0:
+        result -= np.float32(recipe.black_point)
+        result /= np.float32(recipe.white_point - recipe.black_point)
+    if recipe.shadows != 0.0 or recipe.highlights != 0.0:
+        unit = np.clip(result, 0.0, 1.0)
+        if recipe.shadows != 0.0:
+            result += np.float32(recipe.shadows * 0.25) * np.square(1.0 - unit)
+        if recipe.highlights != 0.0:
+            result += np.float32(recipe.highlights * 0.25) * np.square(unit)
+    if recipe.contrast != 0.0:
+        result -= np.float32(0.18)
+        result *= np.float32(2.0**recipe.contrast)
+        result += np.float32(0.18)
+    if recipe.saturation != 1.0:
+        luminance = result @ REC2020_LUMINANCE
+        result = luminance[:, :, None] + (result - luminance[:, :, None]) * np.float32(recipe.saturation)
+    result = _apply_tone_curve(result, recipe.tone_curve)
+    result = _apply_hsl(result, recipe)
     if not np.isfinite(result).all():
         raise RuntimeError("Edit recipe produced non-finite scene-linear values")
     return result.astype(np.float32, copy=False)
+
+
+def _convert_material(rgb: np.ndarray, recipe: EditRecipe) -> np.ndarray:
+    if recipe.material == "positive":
+        if recipe.slide_fade == 0.0:
+            return rgb
+        black = np.asarray(
+            [recipe.slide_black_red, recipe.slide_black_green, recipe.slide_black_blue],
+            dtype=np.float32,
+        )
+        white = np.asarray(
+            [recipe.slide_white_red, recipe.slide_white_green, recipe.slide_white_blue],
+            dtype=np.float32,
+        )
+        normalized = (rgb - black) / (white - black)
+        rgb += np.float32(recipe.slide_fade) * (normalized - rgb)
+        return rgb
+    base = np.asarray(
+        [recipe.film_base_red, recipe.film_base_green, recipe.film_base_blue],
+        dtype=np.float32,
+    )
+    np.maximum(rgb / base, np.float32(2.0**-16), out=rgb)
+    np.log2(rgb, out=rgb)
+    rgb *= np.asarray(
+        [
+            -recipe.film_density * recipe.film_red_ratio,
+            -recipe.film_density,
+            -recipe.film_density * recipe.film_blue_ratio,
+        ],
+        dtype=np.float32,
+    )
+    rgb -= np.float32(recipe.film_dmin)
+    rgb /= np.float32(recipe.film_dmax - recipe.film_dmin)
+    if recipe.material == "bw_negative":
+        luminance = rgb @ REC2020_LUMINANCE
+        rgb = np.repeat(luminance[:, :, None], 3, axis=2)
+    return rgb
+
+
+def _apply_tone_curve(rgb: np.ndarray, curve: tuple[float, float, float, float, float]) -> np.ndarray:
+    if curve == IDENTITY_TONE_CURVE:
+        return rgb
+    luminance = rgb @ REC2020_LUMINANCE
+    bounded = np.clip(luminance, 0.0, 1.0)
+    mapped = np.interp(
+        bounded,
+        np.asarray(IDENTITY_TONE_CURVE, dtype=np.float32),
+        np.asarray(curve, dtype=np.float32),
+    ).astype(np.float32)
+    rgb += (mapped - bounded)[:, :, None]
+    return rgb
+
+
+def _apply_hsl(rgb: np.ndarray, recipe: EditRecipe) -> np.ndarray:
+    if (
+        recipe.hsl_hue == NEUTRAL_HSL
+        and recipe.hsl_saturation == NEUTRAL_HSL
+        and recipe.hsl_lightness == NEUTRAL_HSL
+    ):
+        return rgb
+    linear_srgb = rgb @ REC2020_TO_SRGB.T
+    encoded = _encode_srgb(linear_srgb)
+    bounded = np.clip(encoded, 0.0, 1.0)
+    hls = cv2.cvtColor(np.ascontiguousarray(bounded), cv2.COLOR_RGB2HLS)
+    position = hls[:, :, 0] / np.float32(45.0)
+    lower = np.floor(position).astype(np.intp) % 8
+    fraction = position - np.floor(position)
+
+    def interpolate(values: tuple[float, ...]) -> np.ndarray:
+        controls = np.asarray(values, dtype=np.float32)
+        return controls[lower] * (1.0 - fraction) + controls[(lower + 1) % 8] * fraction
+
+    hls[:, :, 0] = np.mod(hls[:, :, 0] + interpolate(recipe.hsl_hue), np.float32(360.0))
+    hls[:, :, 1] = _adjust_unit_axis(hls[:, :, 1], interpolate(recipe.hsl_lightness))
+    hls[:, :, 2] = _adjust_unit_axis(hls[:, :, 2], interpolate(recipe.hsl_saturation))
+    adjusted = cv2.cvtColor(hls, cv2.COLOR_HLS2RGB)
+    encoded += adjusted - bounded
+    return _decode_srgb(encoded) @ SRGB_TO_REC2020.T
+
+
+def _adjust_unit_axis(values: np.ndarray, adjustment: np.ndarray) -> np.ndarray:
+    return np.where(
+        adjustment < 0.0,
+        values * (1.0 + adjustment),
+        values + (1.0 - values) * adjustment,
+    ).astype(np.float32)
+
+
+def _encode_srgb(linear: np.ndarray) -> np.ndarray:
+    encoded = linear * np.float32(12.92)
+    high = linear > np.float32(0.0031308)
+    encoded[high] = (
+        np.float32(1.055) * np.power(linear[high], np.float32(1.0 / 2.4)) - np.float32(0.055)
+    )
+    return encoded
+
+
+def _decode_srgb(encoded: np.ndarray) -> np.ndarray:
+    linear = encoded / np.float32(12.92)
+    high = encoded > np.float32(0.04045)
+    linear[high] = np.power(
+        (encoded[high] + np.float32(0.055)) / np.float32(1.055),
+        np.float32(2.4),
+    )
+    return linear
 
 
 def render_editor_preview(
